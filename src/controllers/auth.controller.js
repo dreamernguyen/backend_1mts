@@ -1,251 +1,171 @@
 const User = require('../models/user.model');
-const PantryItem = require('../models/pantry.model');
-const Receipt = require('../models/receipt.model');
-const jwt = require('jsonwebtoken');
-const { OAuth2Client } = require('google-auth-library');
+const Item = require('../models/item.model');
+const Transaction = require('../models/transaction.model');
+const Notification = require('../models/notification.model');
+const { admin } = require('../config/firebase.config'); // Firebase Admin SDK
+const { asyncHandler } = require('../middleware/errorHandler.middleware');
 
-// Khởi tạo Google OAuth2 Client để tự giải mã chữ ký Token ở Server Node.js
-const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
+// Sync Google auth với MongoDB
+exports.loginWithGoogle = asyncHandler(async (req, res) => {
+    const { idToken } = req.body; 
 
-/**
- * NGHIỆP VỤ 1: ĐĂNG NHẬP BẰNG GOOGLE (Web / Android)
- */
-exports.loginWithGoogle = async (req, res) => {
-    try {
-        const { idToken } = req.body;
+    // Xác thực token bằng Firebase
+    const decodedToken = await admin.auth().verifyIdToken(idToken);
+    
+    // Đảm bảo token gửi lên đúng là của Google
+    if (decodedToken.firebase.sign_in_provider !== 'google.com') {
+        return res.status(400).json({ success: false, message: 'Định dạng đăng nhập không hợp lệ!' });
+    }
 
-        if (!idToken) {
-            return res.status(400).json({
-                success: false,
-                message: "Tham số idToken từ Google không được để trống!"
-            });
-        }
+    const { uid: firebaseUid, email, name, picture } = decodedToken;
 
-        // 1. Xác thực ID Token trực tiếp với Google API
-        const ticket = await googleClient.verifyIdToken({
-            idToken: idToken,
-            audience: process.env.GOOGLE_CLIENT_ID 
-        });
-        
-        const payload = ticket.getPayload();
-        const { sub: googleId, email, name, picture } = payload;
+    // get or create user
+    let user = await User.findOne({ loginType: 'google', providerId: firebaseUid });
+    const isNewUser = !user;
 
-        // 2. Tra cứu tài khoản Google trong Database
-        let user = await User.findOne({ loginType: 'google', providerId: googleId });
-
-        let isNewUser = false;
-        if (!user) {
-            user = await User.create({
-                email: email,
-                displayName: name,
-                avatar: picture,
-                loginType: 'google',
-                providerId: googleId
-            });
-            isNewUser = true;
-        }
-
-        // 3. Khởi tạo Token JWT nội bộ của 1MTS
-        const sessionToken = jwt.sign(
-            { userId: user._id, loginType: user.loginType },
-            process.env.JWT_SECRET,
-            { expiresIn: '30d' }
-        );
-
-        return res.status(200).json({
-            success: true,
-            message: isNewUser ? "Khởi tạo tài khoản cư dân 1MTS qua Google thành công!" : "Chào mừng trở lại cư dân 1MTS!",
-            token: sessionToken,
-            user
+    if (isNewUser) {
+        user = await User.create({
+            email, displayName: name, avatar: picture,
+            loginType: 'google', providerId: firebaseUid
         });
 
-    } catch (error) {
-        console.error(`[Auth Error - Google]: ${error.message}`);
-        return res.status(401).json({
-            success: false,
-            message: "Mã xác thực Google không hợp lệ hoặc đã hết hạn!",
-            error: error.message
+        // Gửi thông báo chào mừng
+        await Notification.create({
+            userId: user._id,
+            title: 'Chào mừng thành viên mới! 🎉',
+            message: `Chào mừng cư dân ${user.displayName} đã đến với hành trình sinh tồn - 1MTS`,
+            type: 'SYSTEM'
         });
     }
-};
 
-/**
- * NGHIỆP VỤ 2: ĐĂNG NHẬP CHẾ ĐỘ KHÁCH (GUEST)
- */
-exports.loginAsGuest = async (req, res) => {
-    try {
-        const { deviceId, deviceName } = req.body;
+    console.log(`[API] ${req.method} ${req.originalUrl} - Success (User: ${user._id})`);
+    return res.status(200).json({
+        success: true,
+        message: isNewUser ? 'Khởi tạo tài khoản Google thành công!' : 'Chào mừng trở lại!',
+        user // Trả về user info, auth token do Firebase quản lý
+    });
+});
 
-        if (!deviceId) {
-            return res.status(400).json({
-                success: false,
-                message: "Mã định danh thiết bị deviceId là bắt buộc ở chế độ Guest!"
-            });
-        }
+// Login dưới dạng Khách (Guest)
+exports.loginAsGuest = asyncHandler(async (req, res) => {
+    // verify idToken từ Firebase Anonymous Auth
+    const { idToken, deviceName } = req.body; 
 
-        let user = await User.findOne({ loginType: 'guest', providerId: deviceId });
+    // Xác thực token bằng Firebase
+    const decodedToken = await admin.auth().verifyIdToken(idToken);
+    
+    if (decodedToken.firebase.sign_in_provider !== 'anonymous') {
+        return res.status(400).json({ success: false, message: 'Chỉ chấp nhận đăng nhập khách!' });
+    }
 
-        let isNewGuest = false;
-        if (!user) {
-            user = await User.create({
-                displayName: deviceName ? `Khách (${deviceName})` : "Khách 1MTS",
-                loginType: 'guest',
-                providerId: deviceId
-            });
-            isNewGuest = true;
-        }
+    const firebaseUid = decodedToken.uid;
 
-        const sessionToken = jwt.sign(
-            { userId: user._id, loginType: 'guest' },
-            process.env.JWT_SECRET,
-            { expiresIn: '365d' }
-        );
+    let user = await User.findOne({ loginType: 'guest', providerId: firebaseUid });
+    const isNewGuest = !user;
 
-        return res.status(200).json({
-            success: true,
-            message: isNewGuest ? "Khởi tạo tài khoản Khách thành công!" : "Đồng bộ và khôi phục dữ liệu tài khoản Khách thành công!",
-            token: sessionToken,
-            user
+    if (isNewGuest) {
+        user = await User.create({
+            displayName: 'Cư dân 1MTS',
+            loginType: 'guest',
+            providerId: firebaseUid
         });
 
-    } catch (error) {
-        console.error(`[Auth Error - Guest]: ${error.message}`);
-        return res.status(500).json({
-            success: false,
-            message: "Lỗi hệ thống xử lý đăng nhập Khách!",
-            error: error.message
+        // Gửi thông báo chào mừng
+        await Notification.create({
+            userId: user._id,
+            title: 'Chào mừng thành viên mới! 🎉',
+            message: `Chào mừng cư dân ${user.displayName} đã đến với hành trình sinh tồn - 1MTS`,
+            type: 'SYSTEM'
         });
     }
-};
 
-/**
- * NGHIỆP VỤ NÂNG CAO 3: LIÊN KẾT TÀI KHOẢN KHÁCH SANG GOOGLE (ACCOUNT LINKING - RESOLVING CONFLICTS)
- * Giúp người dùng chuyển đổi tài khoản Khách lên Google mà không mất tủ lạnh cũ.
- * Xử lý thông minh trường hợp tài khoản Google đích đã tồn tại trên hệ thống.
- */
-exports.linkGoogleAccount = async (req, res) => {
-    try {
-        const { idToken, guestUserId, confirmOverwrite } = req.body;
+    console.log(`[API] ${req.method} ${req.originalUrl} - Success (Guest: ${user._id})`);
+    return res.status(200).json({
+        success: true,
+        message: isNewGuest ? 'Khởi tạo tài khoản Khách thành công!' : 'Đồng bộ và khôi phục dữ liệu Khách thành công!',
+        user
+    });
+});
 
-        if (!idToken || !guestUserId) {
-            return res.status(400).json({
-                success: false,
-                message: "Cần cung cấp đầy đủ idToken của Google và guestUserId hiện tại!"
-            });
-        }
+// Cập nhật thông tin DB sau khi Firebase linkCredential Google
+exports.linkGoogleAccount = asyncHandler(async (req, res) => {
+    // middleware đã verify idToken mới và gán req.user.firebaseUid
+    
+    const { guestUserId } = req.body;
 
-        // 1. Xác thực Google Token truyền lên từ Client
-        const ticket = await googleClient.verifyIdToken({
-            idToken: idToken,
-            audience: process.env.GOOGLE_CLIENT_ID 
-        });
-        
-        const payload = ticket.getPayload();
-        const { sub: googleId, email, name, picture } = payload;
-
-        // 2. Tìm kiếm xem tài khoản Google này đã từng tồn tại chưa
-        const existingGoogleUser = await User.findOne({ loginType: 'google', providerId: googleId });
-        
-        if (existingGoogleUser) {
-            // TRƯỜNG HỢP PHÁT SINH XUNG ĐỘT (Conflict): Tài khoản Google đã có dữ liệu từ trước
-            if (confirmOverwrite === true) {
-                // LỰA CHỌN 1: Người dùng chấp nhận Ghi đè (Xóa dữ liệu cũ của Google, giữ dữ liệu Khách hiện tại)
-                console.log(`[Account Linking] Tiến hành dọn dẹp dữ liệu cũ của tài khoản Google: ${existingGoogleUser._id}`);
-                
-                // Xóa tủ lạnh và hóa đơn gắn liền với tài khoản Google cũ để giải phóng tài nguyên
-                await PantryItem.deleteMany({ userId: existingGoogleUser._id });
-                await Receipt.deleteMany({ userId: existingGoogleUser._id });
-                
-                // Xóa thực thể User Google cũ
-                await User.findByIdAndDelete(existingGoogleUser._id);
-            } else {
-                // Nếu chưa xác nhận ghi đè, trả về mã lỗi 409 Conflict kèm chỉ dẫn cho Flutter hiển thị Popup lựa chọn
-                return res.status(409).json({
-                    success: false,
-                    code: "GOOGLE_ACCOUNT_ALREADY_EXISTS",
-                    message: "Tài khoản Google này đã được sử dụng và có dữ liệu kho lương riêng trên hệ thống!",
-                    suggestion: "Vui lòng lựa chọn: Ghi đè dữ liệu cũ, hoặc Thoát tài khoản khách để đăng nhập trực tiếp bằng Google."
-                });
-            }
-        }
-
-        // 3. Tìm tài khoản Khách hiện tại đang dùng trên điện thoại
-        const guestUser = await User.findById(guestUserId);
-        if (!guestUser || guestUser.loginType !== 'guest') {
-            return res.status(404).json({
-                success: false,
-                message: "Không tìm thấy thông tin tài khoản Khách hợp lệ cần liên kết!"
-            });
-        }
-
-        // 4. TIẾN HÀNH CHUYỂN ĐỔI (UPGRADE):
-        // Giữ nguyên ID gốc của tài khoản khách để toàn bộ PantryItems và Receipts không bị mồ côi
-        guestUser.email = email;
-        guestUser.displayName = name;
-        guestUser.avatar = picture;
-        guestUser.loginType = 'google';
-        guestUser.providerId = googleId; // Thay thế mã thiết bị bằng ID Google
-
-        await guestUser.save();
-
-        // 5. Cấp lại Token JWT mới với quyền hạn tài khoản Google
-        const sessionToken = jwt.sign(
-            { userId: guestUser._id, loginType: 'google' },
-            process.env.JWT_SECRET,
-            { expiresIn: '30d' }
-        );
-
-        return res.status(200).json({
-            success: true,
-            message: "Nâng cấp và đồng bộ tài khoản Google thành công! Toàn bộ kho thực phẩm của bạn đã được liên kết an toàn.",
-            token: sessionToken,
-            user: guestUser
-        });
-
-    } catch (error) {
-        console.error(`[Link Auth Error]: ${error.message}`);
-        return res.status(500).json({
+    // Kiểm tra tính sở hữu
+    if (req.user.userId.toString() !== guestUserId.toString()) {
+        return res.status(403).json({
             success: false,
-            message: "Lỗi hệ thống trong quá trình xử lý liên kết tài khoản!",
-            error: error.message
+            message: 'Bạn không có quyền cập nhật tài khoản này!'
         });
     }
-};
 
-/**
- * NGHIỆP VỤ NÂNG CAO 4: XÓA SẠCH DỮ LIỆU TÀI KHOẢN (DATA CLEAR / RESET)
- */
-exports.deleteAccountData = async (req, res) => {
-    try {
-        const { userId } = req.body;
+    // Lấy lại thông tin từ token vừa được middleware xác thực
+    const firebaseUser = await admin.auth().getUser(req.user.firebaseUid);
+    
+    // Kiểm tra xem provider có thực sự đã link với Google chưa
+    const hasGoogleLink = firebaseUser.providerData.some(p => p.providerId === 'google.com');
+    if (!hasGoogleLink) {
+         return res.status(400).json({ success: false, message: 'Chưa liên kết Google thành công trên Firebase!' });
+    }
 
-        if (!userId) {
-            return res.status(400).json({ success: false, message: "Tham số userId là bắt buộc để dọn dẹp dữ liệu!" });
+    // Tìm tài khoản Khách trong MongoDB
+    const guestUser = await User.findById(guestUserId);
+    if (!guestUser || guestUser.loginType !== 'guest') {
+        return res.status(404).json({ success: false, message: 'Không tìm thấy tài khoản Khách hợp lệ!' });
+    }
+
+    // update thông tin sang google, giữ nguyên _id
+    guestUser.email = firebaseUser.email;
+    guestUser.displayName = firebaseUser.displayName;
+    guestUser.avatar = firebaseUser.photoURL;
+    guestUser.loginType = 'google';
+    await guestUser.save();
+
+    console.log(`[API] ${req.method} ${req.originalUrl} - Linked Google (User: ${guestUserId})`);
+    return res.status(200).json({
+        success: true,
+        message: 'Cập nhật tài khoản sang Google thành công! Toàn bộ dữ liệu được giữ nguyên.',
+        user: guestUser
+    });
+});
+
+// Xóa tài khoản vĩnh viễn
+exports.deleteAccountData = asyncHandler(async (req, res) => {
+    const { userId } = req.body;
+
+    if (req.user.userId.toString() !== userId.toString()) {
+        return res.status(403).json({
+            success: false,
+            message: 'Bạn không có quyền xóa dữ liệu của tài khoản khác!'
+        });
+    }
+
+    // 1. Xóa toàn bộ vật phẩm và lịch sử giao dịch trong MongoDB
+    await Item.deleteMany({ userId });         
+    await Transaction.deleteMany({ userId }); 
+
+    const user = await User.findById(userId);
+    
+    if (user) {
+        // 2. Xóa user trên Firebase Authentication
+        try {
+            await admin.auth().deleteUser(user.providerId);
+        } catch (error) {
+            console.error('Lỗi khi xóa trên Firebase:', error);
+            // Vẫn tiếp tục xóa dưới DB dù Firebase có lỗi
         }
 
-        // 1. Xóa toàn bộ thực phẩm lưu trữ trong tủ lạnh của User này
-        await PantryItem.deleteMany({ userId: userId });
-
-        // 2. Xóa toàn bộ lịch sử hóa đơn mua hàng của User này
-        await Receipt.deleteMany({ userId: userId });
-
-        // 3. Xóa luôn thực thể người dùng khỏi database (Nếu là Guest)
-        const user = await User.findById(userId);
-        if (user && user.loginType === 'guest') {
+        // 3. Xóa luôn thực thể User nếu là Khách
+        if (user.loginType === 'guest') {
             await User.findByIdAndDelete(userId);
         }
-
-        return res.status(200).json({
-            success: true,
-            message: "Đã xóa vĩnh viễn toàn bộ kho thực phẩm, lịch sử hóa đơn và thông tin tài khoản của bạn!"
-        });
-
-    } catch (error) {
-        console.error(`[Delete Account Error]: ${error.message}`);
-        return res.status(500).json({
-            success: false,
-            message: "Lỗi hệ thống khi dọn dẹp dữ liệu tài khoản!",
-            error: error.message
-        });
     }
-};
+
+    console.log(`[API] ${req.method} ${req.originalUrl} - Deleted Account (User: ${userId})`);
+    return res.status(200).json({
+        success: true,
+        message: 'Đã xóa vĩnh viễn toàn bộ dữ liệu tài khoản!'
+    });
+});

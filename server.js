@@ -3,37 +3,72 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const connectDB = require('./src/config/database');
+const { errorHandler } = require('./src/middleware/errorHandler.middleware');
 
-// Nạp các tệp định tuyến (Routes) của dự án
+// Nạp các tệp định tuyến (Routes)
 const authRoutes = require('./src/routes/auth.route');
-const pantryRoutes = require('./src/routes/pantry.route'); 
-const receiptRoutes = require('./src/routes/receipt.route');
+const itemRoutes = require('./src/routes/item.route');
+const transactionRoutes = require('./src/routes/transaction.route');
+const recipeRoutes = require('./src/routes/recipe.route');
+const userRoutes = require('./src/routes/user.route');
+const notificationRoutes = require('./src/routes/notification.route');
 
-// 2. Khởi tạo ứng dụng Web Server
+// Require Firebase & Cron
+const { initializeFirebase } = require('./src/config/firebase.config');
+const { startExpiryCronJob } = require('./src/cron/expiry.cron');
+
 const app = express();
 
-// 3. Tích hợp các Middleware nền tảng
-app.use(cors()); // Hỗ trợ Flutter chạy trên Web/Trình duyệt không bị lỗi chặn CORS
-app.use(express.json({ limit: '10mb' })); // Tăng giới hạn tải trọng để tiếp nhận ảnh chụp hóa đơn Base64 dung lượng lớn
+// Khởi tạo Firebase Admin SDK
+initializeFirebase();
 
-// 4. Kích hoạt cổng kết nối tới đám mây MongoDB Atlas
+// Khởi động Job quét đồ ăn hết hạn hàng ngày
+startExpiryCronJob();
+
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || '').split(',').filter(Boolean);
+
+app.use(cors({
+    origin: allowedOrigins.length > 0
+        ? (origin, callback) => {
+            // Cho phép mobile app (không có origin header) và các domain trong whitelist
+            if (!origin || allowedOrigins.includes(origin)) {
+                callback(null, true);
+            } else {
+                callback(new Error(`CORS: Domain "${origin}" không được phép truy cập!`));
+            }
+        }
+        : true, 
+    methods: ['GET', 'POST', 'PUT', 'DELETE'],
+    allowedHeaders: ['Content-Type', 'Authorization']
+}));
+
+// Tăng giới hạn payload để tiếp nhận ảnh hóa đơn Base64 dung lượng lớn
+app.use(express.json({ limit: '10mb' }));
+
+// Kết nối MongoDB Atlas
 connectDB();
 
-// 5. Khai báo các tuyến đường cổng API cho dự án
+// ROUTES
 app.use('/api/auth', authRoutes);
-app.use('/api/pantry', pantryRoutes);   
-app.use('/api/receipt', receiptRoutes);
+app.use('/api/items', itemRoutes);
+app.use('/api/transactions', transactionRoutes);
+app.use('/api/recipes', recipeRoutes);
+app.use('/api/user', userRoutes);
+app.use('/api/notifications', notificationRoutes);
 
-// 6. Cổng kiểm tra trạng thái sức khỏe máy chủ (Health Check)
+// Health check - Kiểm tra trạng thái server đang sống
 app.get('/health', (req, res) => {
     return res.status(200).json({
         success: true,
-        message: "Hệ thống Backend 1MTS vận hành thông suốt ổn định!",
+        message: 'Hệ thống Backend 1MTS vận hành thông suốt!',
         timestamp: new Date()
     });
 });
 
-// 7. Lắng nghe và mở cổng kết nối tại Port chỉ định
+// Middleware xử lý lỗi tập trung
+app.use(errorHandler);
+
+// Mở cổng lắng nghe
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
     console.log(`===================================================`);

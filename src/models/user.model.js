@@ -37,7 +37,16 @@ const userSchema = new mongoose.Schema(
         isActive: {
             type: Boolean,
             default: true
-        }
+        },
+        savedRecipes: [{
+            type: String
+        }],
+        shoppingList: [{
+            type: String
+        }],
+        fcmTokens: [{
+            type: String
+        }]
     },
     {
         timestamps: true 

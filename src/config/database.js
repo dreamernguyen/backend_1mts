@@ -12,7 +12,11 @@ const connectDB = async () => {
 
         // Thực hiện kết nối đến Cloud với các cấu hình tối ưu hiệu năng
         const conn = await mongoose.connect(dbURI, {
-            autoIndex: true, // Tự động đồng bộ các Index (Chỉ mục) đã định nghĩa trong Schema
+            // Render + Atlas optimization
+            maxPoolSize: 10, // Giới hạn connection pool, tránh quá tải server/Atlas Free Tier
+            serverSelectionTimeoutMS: 5000, // Fail fast nếu DB chết thay vì treo request 30s
+            socketTimeoutMS: 45000, // Đóng connection nếu bị treo quá lâu
+            autoIndex: true, // Tự động build index (ở prod lớn có thể set false)
         });
 
         console.log(`[Database] Kết nối MongoDB thành công đến Host: ${conn.connection.host}`);
