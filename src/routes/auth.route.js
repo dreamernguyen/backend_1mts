@@ -12,7 +12,7 @@ router.post('/google',
 
 // Đăng nhập chế độ Khách: POST /api/auth/guest
 router.post('/guest',
-    requireBody('idToken', 'deviceName'),
+    requireBody('idToken'),
     authController.loginAsGuest
 );
 
