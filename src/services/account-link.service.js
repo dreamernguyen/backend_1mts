@@ -77,9 +77,16 @@ async function promoteGuestUser({ user, firebaseUser, UserModel = User }) {
 
     const wasGuest = user.loginType === 'guest';
     user.email = profile.email;
-    user.displayName = profile.displayName;
-    user.avatar = profile.avatar;
     user.loginType = 'google';
+    
+    // Chỉ ghi đè nếu tài khoản Khách vẫn đang dùng tên mặc định và chưa chọn Avatar
+    if (wasGuest) {
+        if (user.displayName === 'Cư dân 1MTS') user.displayName = profile.displayName;
+        if (!user.avatar || user.avatar.startsWith('http')) user.avatar = profile.avatar;
+    } else if (!user.displayName) {
+        user.displayName = profile.displayName;
+    }
+    
     // Firebase linkWithCredential giữ nguyên UID. Gán lại rõ ràng để dữ liệu
     // Mongo luôn phản ánh đúng identity đã được Firebase xác minh.
     user.providerId = profile.uid;
