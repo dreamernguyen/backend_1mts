@@ -1,3 +1,10 @@
 node_modules
 .env
 src/config/firebase-service-account.json
+test/
+scripts/
+usecase.xml
+*.pyc
+__pycache__/
+fix-*.js
+patch_*.js

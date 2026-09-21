@@ -1,6 +1,7 @@
-const { GoogleGenerativeAI } = require('@google/generative-ai');
+const { GoogleGenerativeAI, TaskType } = require('@google/generative-ai');
+const { AI_PORTION_RULES } = require('../config/recipe-portion.rules');
 
-// Initialize Gemini API
+// Khởi tạo SDK Google Generative AI bằng API Key lấy từ cấu hình môi trường (.env)
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
 
 const formatAiError = (error, defaultPrefix) => {
@@ -11,50 +12,230 @@ const formatAiError = (error, defaultPrefix) => {
     return defaultPrefix + msg;
 };
 
-// Thực hiện Retry với Exponential Backoff và Model Fallback (3.5 -> 2.5)
-const withRetryAndFallback = async (prompt, retries = 3, delayMs = 1000) => {
-    try {
-        const model35 = genAI.getGenerativeModel({ model: "gemini-3.5-flash" });
-        return await model35.generateContent(prompt);
-    } catch (error35) {
-        console.warn(`[AI Service] gemini-3.5-flash lỗi: ${error35.message}. Thử lại với gemini-2.5-flash...`);
-        try {
-            const model25 = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
-            return await model25.generateContent(prompt);
-        } catch (error25) {
-            if (retries <= 1) throw error25;
-            console.warn(`[AI Service] Cả 2 model đều lỗi, thử lại sau ${delayMs}ms... (Còn ${retries - 1} lần)`);
-            await new Promise(resolve => setTimeout(resolve, delayMs));
-            return withRetryAndFallback(prompt, retries - 1, delayMs * 2);
+// Danh sách các model AI được ưu tiên sử dụng theo thứ tự.
+// Nếu model đầu tiên (gemini-3.5-flash-lite) gặp lỗi 429 hoặc quá tải,
+// hệ thống sẽ tự động chuyển sang dùng model tiếp theo (gemini-3.1-flash-lite).
+const FALLBACK_MODELS = ['gemini-3.5-flash-lite', 'gemini-3.1-flash-lite'];
+
+/**
+ * Hàm trung tâm (Core Wrapper) xử lý mọi luồng gọi AI trong ứng dụng.
+ * Tích hợp sẵn cơ chế:
+ * - Model Fallback: Tự động đổi sang model dự phòng nếu model chính lỗi.
+ * - Retry cơ bản: Nếu tất cả các model dự phòng đều lỗi, tự động chờ (delay) và thử lại.
+ * - Timeout: Ngắt kết nối nếu AI xử lý quá thời gian cho phép (tránh treo hệ thống).
+ * - Metadata Tracking: Thu thập lượng Token tiêu thụ (prompt, response) để phục vụ báo cáo đo lường AI.
+ */
+const executeWithFallback = async ({
+    systemInstruction,
+    promptParts,
+    generationConfig,
+    timeoutMs,
+    retries = 0,
+    delayMs = 1000,
+    requestId = 'unknown',
+    contextName = 'AI Service'
+}) => {
+    let lastError = null;
+    let currentDelay = delayMs;
+    
+    for (let r = 0; r <= retries; r++) {
+        const startedAt = Date.now();
+        for (const modelName of FALLBACK_MODELS) {
+            try {
+                const model = genAI.getGenerativeModel({ model: modelName, systemInstruction });
+                const request = model.generateContent({
+                    contents: [{ role: 'user', parts: promptParts }],
+                    ...(generationConfig && { generationConfig })
+                });
+
+                let result;
+                if (timeoutMs) {
+                    result = await Promise.race([
+                        request,
+                        new Promise((_, reject) => setTimeout(() => {
+                            const error = new Error(`Quá thời gian chờ ${timeoutMs}ms`);
+                            error.code = 'AI_TIMEOUT';
+                            reject(error);
+                        }, timeoutMs))
+                    ]);
+                } else {
+                    result = await request;
+                }
+                
+                const response = result.response;
+                const finishReason = response.candidates?.[0]?.finishReason ?? null;
+                if (finishReason === 'MAX_TOKENS') {
+                    const truncatedError = new Error('Gemini dừng với finishReason=MAX_TOKENS trước khi hoàn tất.');
+                    truncatedError.code = 'GEMINI_FINISH_MAX_TOKENS';
+                    truncatedError.statusCode = 502;
+                    throw truncatedError;
+                }
+
+                return {
+                    text: response.text(),
+                    metadata: {
+                        requestId, 
+                        model: modelName,
+                        durationMs: Date.now() - startedAt,
+                        finishReason,
+                        ...readUsageMetadata(response)
+                    },
+                    response
+                };
+            } catch (error) {
+                lastError = error.statusCode ? error : wrapGeminiApiError(error);
+                console.warn(`[${contextName}] Model ${modelName} lỗi: ${lastError.message}`);
+            }
+        }
+        
+        if (r < retries) {
+            console.warn(`[${contextName}] Tất cả model đều lỗi, chờ ${currentDelay}ms rồi thử lại (Lần ${r + 1}/${retries})...`);
+            await new Promise(resolve => setTimeout(resolve, currentDelay));
+            currentDelay *= 2;
         }
     }
+    throw lastError || wrapGeminiApiError(new Error(`[${contextName}] Thất bại sau khi thử tất cả model.`));
 };
 
-// Tạo text embedding cho MongoDB Vector Search
-exports.embedText = async (text) => {
-    if (!process.env.GEMINI_API_KEY) {
-        console.warn('GEMINI_API_KEY is not set. Returning dummy vector.');
-        return new Array(768).fill(0.01);
-    }
+// Cấu hình yêu cầu Gemini trả về JSON thuần túy (không dùng schema cứng để tránh lỗi MAX_TOKENS sớnm)
+const buildReceiptGenerationConfig = () => ({
+    responseMimeType: 'application/json'
+});
+
+// Đọc thông tin Token tiêu thụ từ response Gemini (phục vụ đo lường AI)
+const readUsageMetadata = response => ({
+    promptTokenCount: response.usageMetadata?.promptTokenCount ?? null,
+    candidatesTokenCount: response.usageMetadata?.candidatesTokenCount ?? null,
+    totalTokenCount: response.usageMetadata?.totalTokenCount ?? null
+});
+
+// Chuẩn hóa lỗi từ Gemini API thành dạng lỗi nội bộ có statusCode để Express có thể xử lý
+const wrapGeminiApiError = error => {
+    const apiStatus = Number(error?.status);
+    const hasHttpStatus = Number.isInteger(apiStatus) && apiStatus >= 400 && apiStatus <= 599;
+    const wrapped = new Error(error?.message || 'Gemini API trả về lỗi không có message.');
+    wrapped.code = error?.code || (hasHttpStatus ? `GEMINI_HTTP_${apiStatus}` : 'GEMINI_API_ERROR');
+    wrapped.statusCode = hasHttpStatus ? apiStatus : 502;
+    wrapped.apiStatus = hasHttpStatus ? apiStatus : null;
+    wrapped.apiStatusText = error?.statusText || null;
+    wrapped.errorDetails = error?.errorDetails || null;
+    wrapped.cause = error;
+    return wrapped;
+};
+
+exports.buildReceiptGenerationConfig = buildReceiptGenerationConfig;
+
+// Tính năng 1: Gửi ảnh và trích xuất dữ liệu Hóa đơn / Chỉ số công tơ điện nước.
+// Được thiết kế chuyên biệt để gọi OCR, chỉ trả về JSON, không áp dụng logic timeout quá gắt.
+exports.generateStructuredReceipt = async ({
+    systemInstruction,
+    promptParts,
+    requestId = 'unknown',
+    inputMode = 'unknown'
+}) => {
     try {
-        const model = genAI.getGenerativeModel({ 
-            model: "gemini-embedding-001" 
+        const result = await executeWithFallback({
+            systemInstruction,
+            promptParts,
+            generationConfig: buildReceiptGenerationConfig(),
+            requestId,
+            contextName: 'Receipt AI'
         });
-        
-        // Thêm cấu hình ép kích thước vector ngay trong lệnh gọi API thay vì dùng slice ở mảng trả về
-        const result = await model.embedContent({
-            content: { parts: [{ text }] },
-            outputDimensionality: 768
-        });
-        
-        return result.embedding.values;
+        console.info('[Receipt AI]', { inputMode, ...result.metadata });
+        return { text: result.text, metadata: { inputMode, ...result.metadata } };
     } catch (error) {
-        console.error("Error embedding text:", error);
+        console.warn('[Receipt AI error]', { requestId, inputMode, code: error.code, message: error.message });
         throw error;
     }
 };
 
-// Phân tích nguyên liệu còn thiếu cho công thức nấu ăn
+// Tính năng 2: Đưa ra lời khuyên tài chính (Ví dụ: Đánh giá chi tiêu trong tháng).
+// Chỉ phân tích số liệu (snapshot) do Backend tính sẵn truyền vào prompt.
+// Có áp dụng Timeout (8 giây) để nếu AI chậm, người dùng không phải đợi màn hình loading quá lâu.
+exports.generateStructuredFinanceInsight = async ({ systemInstruction, prompt, requestId = 'unknown' }) => {
+    if (!process.env.GEMINI_API_KEY) {
+        const error = new Error('Gemini chưa được cấu hình.');
+        error.code = 'GEMINI_NOT_CONFIGURED';
+        throw error;
+    }
+    const result = await executeWithFallback({
+        systemInstruction,
+        promptParts: [{ text: prompt }],
+        generationConfig: buildReceiptGenerationConfig(),
+        timeoutMs: 8000,
+        requestId,
+        contextName: 'Finance AI'
+    });
+    return { text: result.text, metadata: result.metadata };
+};
+
+// Tính năng 3: Phân tích chỉ số Sinh tồn (RPG Stats - HP, Mana, DEF, WIS).
+// Tương tự tính năng tài chính, chỉ dùng AI để giải thích số liệu chứ không để AI tự tính điểm.
+exports.generateStructuredSurvivalInsight = exports.generateStructuredFinanceInsight;
+
+exports.generateGeneralAdvice = async (systemInstruction, promptText) => {
+    try {
+        const result = await executeWithFallback({
+            systemInstruction,
+            promptParts: [{ text: promptText }],
+            timeoutMs: 8000,
+            contextName: 'General Advice'
+        });
+        return result.text;
+    } catch (error) {
+        console.error("Error generating general advice:", error);
+        return formatAiError(error, "Xin lỗi, không thể đưa ra lời khuyên: ");
+    }
+};
+
+const RECIPE_EMBEDDING_DIMENSIONS = 768;
+
+function normalizeEmbedding(values, dimensions = RECIPE_EMBEDDING_DIMENSIONS) {
+    if (!Array.isArray(values) || values.length < dimensions) {
+        throw new Error(`Embedding phải có ít nhất ${dimensions} chiều.`);
+    }
+    const vector = values.slice(0, dimensions).map(Number);
+    if (vector.some(value => !Number.isFinite(value))) {
+        throw new Error('Embedding chứa giá trị không hợp lệ.');
+    }
+    const magnitude = Math.sqrt(vector.reduce((sum, value) => sum + value * value, 0));
+    if (!Number.isFinite(magnitude) || magnitude === 0) {
+        throw new Error('Embedding có độ lớn bằng 0.');
+    }
+    return vector.map(value => value / magnitude);
+}
+
+exports.embedText = async (text, {
+    taskType = TaskType.RETRIEVAL_QUERY,
+    title
+} = {}) => {
+    if (!process.env.GEMINI_API_KEY) {
+        const error = new Error('Thiếu GEMINI_API_KEY; không thể tạo embedding thật.');
+        error.code = 'RECIPE_EMBEDDING_NOT_CONFIGURED';
+        throw error;
+    }
+    const input = String(text || '').trim();
+    if (!input) throw new Error('Nội dung embedding không được để trống.');
+    try {
+        const model = genAI.getGenerativeModel({ model: 'gemini-embedding-001' });
+        const result = await model.embedContent({
+            content: { parts: [{ text: input }] },
+            taskType,
+            ...(title ? { title: String(title).trim() } : {})
+        });
+        return normalizeEmbedding(result.embedding.values);
+    } catch (error) {
+        console.error('Error embedding text:', error.message);
+        throw error;
+    }
+};
+
+exports.RECIPE_EMBEDDING_DIMENSIONS = RECIPE_EMBEDDING_DIMENSIONS;
+exports.RECIPE_EMBEDDING_MODEL = 'gemini-embedding-001';
+exports.normalizeEmbedding = normalizeEmbedding;
+
+// Tính năng 4: So sánh Tủ lạnh và Công thức nấu ăn để tìm ra "Nguyên liệu còn thiếu".
+// Phân loại thiếu nguyên liệu chính (core) và nguyên liệu phụ (extra).
 exports.analyzeMissingIngredients = async (recipe, fridgeItems) => {
     try {
         const prompt = `
@@ -82,8 +263,12 @@ Hãy trả về CHỈ 1 object JSON hợp lệ với định dạng:
   "missingExtra": [ { "itemName": "Tên nguyên liệu giống hệt trong công thức gốc", "amount": 100, "unit": "G", "displayQuantity": "Số lượng" } ]
 }
 `;
-        const result = await withRetryAndFallback(prompt);
-        const responseText = result.response.text().replace(/```json/g, '').replace(/```/g, '').trim();
+        const result = await executeWithFallback({
+            promptParts: [{ text: prompt }],
+            retries: 2,
+            contextName: 'Missing Ingredients'
+        });
+        const responseText = result.text.replace(/```json/g, '').replace(/```/g, '').trim();
         return JSON.parse(responseText);
     } catch (error) {
         console.error("Error analyzing missing ingredients:", error);
@@ -91,7 +276,9 @@ Hãy trả về CHỈ 1 object JSON hợp lệ với định dạng:
     }
 };
 
-// Chọn hoặc sáng tạo công thức dọn tủ lạnh
+// Tính năng 5: Đề xuất món ăn "Dọn tủ lạnh".
+// Thuật toán: Dựa trên kho thực phẩm sắp hết hạn, chọn 1 món từ cơ sở dữ liệu.
+// Nếu không tìm được món phù hợp, AI sẽ TỰ SÁNG TẠO 1 món hoàn toàn mới.
 exports.decideFridgeClearingRecipe = async (topRecipes, fridgeItems) => {
     try {
         const prompt = `
@@ -142,18 +329,22 @@ Trở thành 1 JSON chuẩn xác như sau:
 }
 LƯU Ý QUAN TRỌNG: NẾU BẠN CHỌN TỪ DB (isFromDatabase=true), customRecipe để trống (null). NẾU TỰ CHẾ (isFromDatabase=false), ĐẢM BẢO customRecipe CÓ ĐỦ DỮ LIỆU ĐỂ LƯU VÀO DATABASE BÊN DƯỚI.
 `;
-        return await withRetry(async () => {
-            const result = await model.generateContent(prompt);
-            const responseText = result.response.text().replace(/```json/g, '').replace(/```/g, '').trim();
-            return JSON.parse(responseText);
+        const result = await executeWithFallback({
+            promptParts: [{ text: prompt }],
+            retries: 2,
+            contextName: 'Fridge Clearing'
         });
+        const responseText = result.text.replace(/```json/g, '').replace(/```/g, '').trim();
+        return JSON.parse(responseText);
     } catch (error) {
         console.error("Error deciding fridge clearing recipe:", error);
         throw new Error(formatAiError(error, "Lỗi khi gọi AI đề xuất món ăn: "));
     }
 };
 
-// Tư vấn "Hôm nay ăn gì" dựa trên Báo cáo Tủ lạnh (Kiến trúc Hybrid)
+// Tính năng 6: Bếp trưởng AI (Tư vấn Bữa ăn Thông minh - Kiến trúc Hybrid).
+// Kết hợp giữa quy tắc cứng (Rule-based) và AI Semantic.
+// Bắt buộc AI tuân thủ các quy tắc tận dụng đồ ăn thừa và tránh lãng phí thực phẩm.
 exports.consultHeadChefAI = async (report) => {
     try {
         const prompt = `
@@ -165,6 +356,7 @@ Bạn là Bếp trưởng sinh tồn chuyên nghiệp. Dưới đây là Báo c�
 
 Dựa trên nguyên tắc ưu tiên dọn tủ, hãy ra quyết định chọn món. Luôn cố gắng giúp người dùng có một bữa ăn ngon nhất.
 Luật lệ BẮT BUỘC:
+0. Chỉ dùng nguyên liệu xuất hiện trong báo cáo. Tuyệt đối không đề xuất nấu hoặc ăn thực phẩm đã hết hạn.
 1. NẾU CÓ Đồ ăn chín sắp hỏng: Bắt buộc khuyên người dùng hâm nóng ăn lại.
 2. Nếu Đồ ăn chín là món MẶN, và đồ tươi có rau/thịt hợp lý: Khuyên nấu thêm món CANH/XÀO để ăn kèm (Phối hợp món). KHÔNG khuyên canh ăn với canh.
 3. Nếu KHÔNG CÓ Đồ ăn chín: Ưu tiên dùng các "Đồ tươi SẮP HỎNG" để sáng tạo món ăn mới.
@@ -177,34 +369,32 @@ Bạn PHẢI trả về CHỈ 1 object JSON hợp lệ với định dạng sau:
   // CHỈ ĐIỀN "customRecipe" NẾU "type" LÀ "MIXED_MEAL" hoặc "NEW_RECIPE":
   "customRecipe": {
     "title": "Tên món nấu thêm (Canh / Xào / Mới hoàn toàn)",
-    "mealType": "LUNCH",
-    "difficulty": "MEDIUM",
-    "prepTime": 10,
-    "cookTime": 15,
-    "servings": 1,
-    "nutrition": { "calories": 400, "protein": 20, "carbs": 10, "fat": 10 },
+    "description": "Mô tả ngắn",
+    "dishType": "MAIN",
+    "cookingTimeMinutes": 25,
+    "baseServings": 2,
     "ingredients": [
       {
-        "itemName": "Tên",
-        "amount": 100,
+        "name": "Tên nguyên liệu chuẩn, không có thương hiệu",
+        "amount": 300,
         "unit": "G",
-        "displayQuantity": "100g",
-        "isCore": true
+        "required": true
       }
     ],
-    "steps": [
-      {
-        "order": 1,
-        "instruction": "Làm gì..."
-      }
-    ]
+    "steps": ["Bước nấu ngắn gọn, tối đa hai câu"],
+    "tags": []
   }
 }
 Lưu ý: Nếu type="LEFTOVER_ONLY", "customRecipe" để là null. 
-NẾU tạo customRecipe, ĐẢM BẢO trả về đủ các trường yêu cầu.
+NẾU tạo customRecipe, chỉ dùng unit G, KG, ML, L hoặc PIECE; tối đa 10 bước và phải có ít nhất một nguyên liệu required=true.
+${AI_PORTION_RULES}
 `;
-        const result = await withRetryAndFallback(prompt);
-        const responseText = result.response.text().replace(/```json/g, '').replace(/```/g, '').trim();
+        const result = await executeWithFallback({
+            promptParts: [{ text: prompt }],
+            retries: 2,
+            contextName: 'Chef AI'
+        });
+        const responseText = result.text.replace(/```json/g, '').replace(/```/g, '').trim();
         return JSON.parse(responseText);
     } catch (error) {
         console.error("Error consulting chef AI:", error);

@@ -10,6 +10,11 @@ router.post('/parse',
     txController.parseDocument
 );
 
+router.post('/normalize-draft',
+    verifyToken,
+    txController.normalizeDraft
+);
+
 // Lưu giao dịch chính thức - POST /api/transactions
 router.post('/',
     verifyToken,
@@ -21,6 +26,33 @@ router.post('/',
 router.get('/user/:userId',
     verifyToken, checkOwnership, validateObjectId('userId'),
     txController.getHistory
+);
+
+// Lấy thống kê thu chi và Gamification trong chu kỳ hiện tại
+router.get('/stats/cycle',
+    verifyToken,
+    txController.getStatistics
+);
+
+// Lấy thống kê chi tiêu theo tháng - GET /api/transactions/stats/monthly?limit=6
+router.get('/stats/monthly',
+    verifyToken,
+    txController.getMonthlyStats
+);
+
+router.get('/insights/finance',
+    verifyToken,
+    txController.getFinanceInsight
+);
+
+router.get('/insights/survival',
+    verifyToken,
+    txController.getSurvivalInsight
+);
+
+router.post('/insights/advice',
+    verifyToken,
+    txController.getAdviceInsight
 );
 
 // Lấy chi tiết một giao dịch - GET /api/transactions/:id

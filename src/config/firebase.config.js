@@ -6,6 +6,8 @@ const serviceAccountPath = path.resolve(__dirname, 'firebase-service-account.jso
 
 const initializeFirebase = () => {
     try {
+        if (admin.apps.length > 0) return true;
+
         if (process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_PRIVATE_KEY && process.env.FIREBASE_CLIENT_EMAIL) {
             // Dùng Environment Variables trên Render
             admin.initializeApp({
@@ -24,10 +26,12 @@ const initializeFirebase = () => {
             });
             console.log('[Firebase] Đã khởi tạo Firebase Admin bằng file JSON cục bộ.');
         } else {
-            console.error('[Firebase] LỖI NGHIÊM TRỌNG: Không có cấu hình Firebase (Thiếu Env Vars và File JSON). Các API xác thực sẽ bị sập!');
+            throw new Error('Không có cấu hình Firebase Admin hợp lệ.');
         }
+        return true;
     } catch (error) {
         console.error('[Firebase] Lỗi khi khởi tạo Firebase Admin:', error.message);
+        throw error;
     }
 };
 

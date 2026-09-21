@@ -1,9 +1,32 @@
 const Item = require('../models/item.model');
+const { usableInventory } = require('./recipe-matching.service');
 
-// Gom nhóm các vật phẩm trong tủ lạnh thành AI.
-exports.generateInventoryReport = async (userId) => {
-    const items = await Item.find({ userId: userId, usageStatus: 'ACTIVE' });
+function daysRemaining(item, now = new Date()) {
+    if (!item.expiryDate || item.expirySource === 'NOT_APPLICABLE') return null;
+    const start = new Date(now);
+    start.setHours(0, 0, 0, 0);
+    const expiry = new Date(item.expiryDate);
+    expiry.setHours(0, 0, 0, 0);
+    return Math.ceil((expiry - start) / 86400000);
+}
 
+function createUsableInventorySnapshot(items, now = new Date()) {
+    return usableInventory(items, now);
+}
+
+exports.loadUsableInventorySnapshot = async (userId, now = new Date()) => {
+    const items = await Item.find({
+        userId,
+        usageStatus: 'ACTIVE',
+        quantity: { $gt: 0 },
+        standardQuantity: { $gt: 0 }
+    }).sort({ expiryDate: 1, createdAt: 1 }).lean();
+
+    return createUsableInventorySnapshot(items, now);
+};
+
+// Dựng context AI từ chính snapshot đã qua hard gate quantity/expiry.
+function generateInventoryReportFromSnapshot(items, now = new Date()) {
     const report = {
         isEmpty: items.length === 0,
         onlySpices: true, 
@@ -21,7 +44,7 @@ exports.generateInventoryReport = async (userId) => {
             report.onlySpices = false; 
         }
 
-        const daysLeft = item.daysRemaining; // Sử dụng virtual field từ schema
+        const daysLeft = daysRemaining(item, now);
 
         if (item.isCookedMeal) {
             let label = `${item.itemName} (${item.quantity} bữa)`;
@@ -46,4 +69,13 @@ exports.generateInventoryReport = async (userId) => {
     }
 
     return report;
+}
+
+// Giữ API service cũ cho call site khác, nhưng vẫn dùng cùng quy tắc snapshot.
+exports.generateInventoryReport = async (userId, now = new Date()) => {
+    const snapshot = await exports.loadUsableInventorySnapshot(userId, now);
+    return generateInventoryReportFromSnapshot(snapshot, now);
 };
+
+exports.createUsableInventorySnapshot = createUsableInventorySnapshot;
+exports.generateInventoryReportFromSnapshot = generateInventoryReportFromSnapshot;

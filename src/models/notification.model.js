@@ -17,7 +17,7 @@ const notificationSchema = new mongoose.Schema(
         },
         type: {
             type: String,
-            enum: ['EXPIRY_WARNING', 'SYSTEM', 'MISSION_COMPLETE'],
+            enum: ['EXPIRY_WARNING', 'SYSTEM', 'MISSION_COMPLETE', 'GAMIFICATION'],
             default: 'SYSTEM'
         },
         isRead: {

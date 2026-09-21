@@ -3,21 +3,27 @@ const Item = require('../models/item.model');
 const User = require('../models/user.model');
 const Notification = require('../models/notification.model');
 const { admin } = require('../config/firebase.config');
+const moment = require('moment-timezone');
 
 const startExpiryCronJob = () => {
     // Chạy vào 08:00 AM mỗi ngày theo giờ Việt Nam
     cron.schedule('0 8 * * *', async () => {
         console.log('[Cron] Bắt đầu quét đồ ăn sắp hết hạn...');
         try {
-            const today = new Date();
-            today.setHours(0, 0, 0, 0);
+            // Lấy 00:00:00 của ngày hiện tại theo giờ VN
+            const todayM = moment().tz('Asia/Ho_Chi_Minh').startOf('day');
+            const today = todayM.toDate();
 
-            const targetDate = new Date(today);
-            targetDate.setDate(today.getDate() + 3);
+            // Tính 3 ngày sau
+            const targetDateM = moment(todayM).add(3, 'days');
+            const targetDate = targetDateM.toDate();
 
-            // Tìm tất cả item có expiryDate <= today + 3 ngày
+            // Chỉ cảnh báo lô thực phẩm còn tồn và sẽ hết hạn trong 3 ngày tới.
             const items = await Item.find({
-                expiryDate: { $lte: targetDate }
+                expiryDate: { $gte: today, $lte: targetDate },
+                usageStatus: 'ACTIVE',
+                quantity: { $gt: 0 },
+                category: { $in: ['MEAT', 'SEAFOOD', 'VEGETABLE', 'FRUIT', 'EGG', 'DRY_FOOD', 'DRINK', 'SPICE'] }
             });
 
             if (items.length === 0) {
@@ -43,12 +49,11 @@ const startExpiryCronJob = () => {
                 
                 // Tạo nội dung thông báo tổng hợp
                 const title = 'Cảnh báo hạn sử dụng!';
-                const message = `Tủ lạnh đang khóc thét: Bạn có ${expiringItems.length} món đồ ăn sắp hoặc đã hết hạn. Hãy kiểm tra ngay!`;
+                const message = `Bạn có ${expiringItems.length} lô thực phẩm sẽ hết hạn trong 3 ngày tới. Hãy ưu tiên sử dụng!`;
 
                 // Kiểm tra xem hôm nay đã gửi thông báo EXPIRY_WARNING cho user này chưa
-                const startOfDay = new Date(today);
-                const endOfDay = new Date(today);
-                endOfDay.setHours(23, 59, 59, 999);
+                const startOfDay = todayM.toDate();
+                const endOfDay = moment(todayM).endOf('day').toDate();
 
                 const existingNotif = await Notification.findOne({
                     userId: userId,
@@ -68,19 +73,31 @@ const startExpiryCronJob = () => {
                     type: 'EXPIRY_WARNING'
                 });
 
-                // Bắn FCM Push Notification nếu người dùng có Token
-                if (admin.apps && admin.apps.length > 0 && user.fcmTokens && user.fcmTokens.length > 0) {
+                // Lọc các token hợp lệ
+                const validTokens = (user.fcmTokens || []).filter(t => t && t.trim().length > 0);
+
+                // Bắn FCM Push Notification nếu người dùng có Token hợp lệ
+                if (admin.apps && admin.apps.length > 0 && validTokens.length > 0) {
                     const payload = {
                         notification: {
                             title: title,
                             body: message
                         },
-                        tokens: user.fcmTokens
+                        tokens: validTokens
                     };
 
                     try {
                         const response = await admin.messaging().sendEachForMulticast(payload);
                         console.log(`[Firebase] Đã gửi ${response.successCount} push notification cho user ${userId}`);
+                        
+                        // Cập nhật cơ chế dọn dẹp các token lỗi (nếu cần thiết sau này)
+                        if (response.failureCount > 0) {
+                            response.responses.forEach((resp, idx) => {
+                                if (!resp.success) {
+                                    console.error(`[Firebase] Token fail at idx ${idx}:`, resp.error?.code);
+                                }
+                            });
+                        }
                     } catch (fcmError) {
                         console.error('[Firebase] Lỗi khi gửi FCM:', fcmError.message);
                     }

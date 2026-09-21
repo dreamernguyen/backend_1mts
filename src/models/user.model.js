@@ -1,5 +1,31 @@
 const mongoose = require('mongoose');
 
+const rpgStatsSchema = new mongoose.Schema({
+    level: { type: Number, default: 1 },
+    xp: { type: Number, default: 0 },
+    maxHp: { type: Number, default: 100 },
+    hp: { type: Number, default: 100 },
+    mana: { type: Number, default: 0 },
+    def: { type: Number, default: 0 },
+    wis: { type: Number, default: 50 },
+    bonusWis: { type: Number, default: 0 }, // Điểm thưởng do mua sắm thông minh
+    loginStreak: { type: Number, default: 0 },
+    lastLoginDate: { type: Date },
+    formulaVersion: { type: String, default: 'rpg_v3' },
+    dataCoverage: { type: Number, default: 0, min: 0, max: 1 },
+    statBreakdown: { type: mongoose.Schema.Types.Mixed, default: () => ({}) }
+}, { _id: false });
+
+const achievementSchema = new mongoose.Schema({
+    questId: { type: mongoose.Schema.Types.ObjectId, ref: 'Quest' },
+    unlockedAt: { type: Date, default: Date.now }
+}, { _id: false });
+
+const achievementProgressSchema = new mongoose.Schema({
+    questId: { type: mongoose.Schema.Types.ObjectId, ref: 'Quest', required: true },
+    progress: { type: Number, default: 0, min: 0 }
+}, { _id: false });
+
 const userSchema = new mongoose.Schema(
     {
         email: {
@@ -32,7 +58,29 @@ const userSchema = new mongoose.Schema(
         },
         monthlyBudget: {
             type: Number,
-            default: 0
+            default: 0,
+            min: 0
+        },
+        fixedBudget: {
+            type: Number,
+            default: 0,
+            min: 0
+        },
+        savingsFund: {
+            type: Number,
+            default: 0,
+            min: 0
+        },
+        essentialBudget: {
+            type: Number,
+            default: 0,
+            min: 0
+        },
+        cycleStartDay: {
+            type: Number,
+            default: 1, // Mặc định mùng 1 hàng tháng
+            min: 1,
+            max: 28 // Giới hạn đến 28 để an toàn cho mọi tháng
         },
         isActive: {
             type: Boolean,
@@ -45,6 +93,19 @@ const userSchema = new mongoose.Schema(
             type: String
         }],
         fcmTokens: [{
+            type: String
+        }],
+        rpgStats: {
+            type: rpgStatsSchema,
+            default: () => ({})
+        },
+        achievements: [achievementSchema],
+        achievementProgress: [achievementProgressSchema],
+        activeTitle: {
+            type: String,
+            default: 'Tân Binh Sinh Tồn'
+        },
+        unlockedTitles: [{
             type: String
         }]
     },

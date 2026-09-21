@@ -98,6 +98,26 @@ const itemSchema = new Schema(
       type: Boolean,
       default: false,
     },
+    sourceRecipeId: {
+      type: String,
+      trim: true,
+      default: null,
+    },
+    cookIdempotencyKey: {
+      type: String,
+      trim: true,
+      maxlength: 120,
+      default: null,
+    },
+    isFromSuggestion: {
+      type: Boolean,
+      default: false,
+    },
+    rescuedCount: {
+      type: Number,
+      min: 0,
+      default: 0,
+    },
     purchasePrice: {
       type: Number,
       required: [true, "Giá mua thực tế là bắt buộc để thống kê chi tiêu!"],
@@ -112,6 +132,22 @@ const itemSchema = new Schema(
     expiryDate: {
       type: Date,
       required: false,
+      default: null,
+    },
+    storageLocation: {
+      type: String,
+      enum: ["FRIDGE", "FREEZER", "PANTRY"],
+      default: null,
+    },
+    expirySource: {
+      type: String,
+      enum: ["USER", "ESTIMATED_RULE", "LEGACY_UNKNOWN", "NOT_APPLICABLE"],
+      default: "LEGACY_UNKNOWN",
+    },
+    expiryRuleCode: {
+      type: String,
+      trim: true,
+      maxlength: [80, "Mã quy tắc hạn dùng không được dài quá 80 ký tự"],
       default: null,
     },
     usageStatus: {
@@ -132,10 +168,7 @@ const itemSchema = new Schema(
 
 // Tính ngày còn hạn
 itemSchema.virtual("daysRemaining").get(function () {
-  if (
-    !this.expiryDate ||
-    ["COSMETIC", "SUPPLEMENT", "SPICE"].includes(this.category)
-  ) {
+  if (!this.expiryDate || this.expirySource === "NOT_APPLICABLE") {
     return null;
   }
   const now = new Date();
@@ -147,10 +180,7 @@ itemSchema.virtual("daysRemaining").get(function () {
 
 // Phân loại trạng thái hạn dựa trên ngày còn lại
 itemSchema.virtual("storageStatus").get(function () {
-  if (
-    !this.expiryDate ||
-    ["COSMETIC", "SUPPLEMENT", "SPICE"].includes(this.category)
-  ) {
+  if (!this.expiryDate || this.expirySource === "NOT_APPLICABLE") {
     return "STABLE";
   }
 
@@ -161,8 +191,20 @@ itemSchema.virtual("storageStatus").get(function () {
   return "FRESH"; 
 });
 
+// Chỉ là trường dẫn xuất cho UI/API, không lưu thêm dữ liệu trùng lặp trong MongoDB.
+itemSchema.virtual("expiryTracking").get(function () {
+  return this.expirySource !== "NOT_APPLICABLE" && Boolean(this.expiryDate);
+});
+
 // Indexes
 itemSchema.index({ userId: 1, usageStatus: 1, expiryDate: 1 });
+itemSchema.index(
+  { userId: 1, cookIdempotencyKey: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { cookIdempotencyKey: { $type: "string" } },
+  },
+);
 itemSchema.index(
   { itemName: "text" },
   { diacriticSensitive: false, name: "itemName_text_index" },

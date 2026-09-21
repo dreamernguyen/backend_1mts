@@ -19,7 +19,8 @@ router.post('/guest',
 // Liên kết tài khoản Khách lên Google: POST /api/auth/link-google  [Cần đăng nhập]
 router.post('/link-google',
     verifyToken,
-    requireBody('idToken', 'guestUserId'),
+    // ID token đã được xác minh từ Authorization header bởi verifyToken.
+    requireBody('guestUserId'),
     authController.linkGoogleAccount
 );
 
