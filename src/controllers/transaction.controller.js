@@ -23,6 +23,7 @@ const {
     validateExtractedReceiptTransactions,
     hasBlockingWarnings
 } = require('../services/receipt-normalizer.service');
+const aiMetricsService = require('../services/aiMetrics.service');
 
 const parseHistoryPeriod = period => {
     if (period == null || String(period).trim() === '') return null;
@@ -221,6 +222,15 @@ QUY TẮC SỐ 2: NẾU ĐỌC ĐƯỢC, BẮT BUỘC TRẢ VỀ JSON SAU:
             imageBytes,
             durationMs: Date.now() - startedAt
         });
+        // Ghi chỉ số AI — fire-and-forget, không await, không ảnh hưởng response
+        aiMetricsService.logReceiptAiResponse({
+            userId: req.user?.userId,
+            sessionId: requestId,
+            latencyMs: aiMetadata?.durationMs ?? null,
+            aiModel: aiMetadata?.model ?? null,
+            cacheHit,
+            inputMode
+        });
     } catch (error) {
         console.error('[Receipt request failed]', {
             requestId,
@@ -228,6 +238,14 @@ QUY TẮC SỐ 2: NẾU ĐỌC ĐƯỢC, BẮT BUỘC TRẢ VỀ JSON SAU:
             durationMs: Date.now() - startedAt,
             code: error.code || 'AI_UNAVAILABLE',
             message: error.message
+        });
+        // Ghi lỗi AI — fire-and-forget
+        aiMetricsService.logReceiptAiError({
+            userId: req.user?.userId,
+            sessionId: requestId,
+            inputMode,
+            errorCode: error.code || 'AI_UNAVAILABLE',
+            errorMessage: error.message
         });
         return res.status(error.statusCode || 503).json({
             success: false,
@@ -523,6 +541,25 @@ exports.addTransaction = asyncHandler(async (req, res) => {
         }
 
         await session.commitTransaction();
+
+        // Ghi USER_CONFIRMED — fire-and-forget, chạy sau khi commit an toàn
+        // Chỉ ghi khi có scanRequestId (tức là lần lưu có AI trước đó)
+        if (req.body.scanRequestId) {
+            const _aiItemCount  = typeof aiItemCount === 'number' ? aiItemCount : null;
+            const _editedFields = typeof aiEditedFieldCount === 'number' ? aiEditedFieldCount : null;
+            // Tổng trường AI đề xuất: số item × 4 trường chính (name, qty, price, category) + 3 trường giao dịch
+            const _totalFields  = _aiItemCount != null ? _aiItemCount * 4 + 3 : null;
+            aiMetricsService.logReceiptUserConfirmed({
+                userId,
+                sessionId: String(req.body.scanRequestId).slice(0, 150),
+                userItemCount: itemsToInject.length,
+                userTotalAmount: Math.round(amount),
+                aiItemCount:  _aiItemCount,
+                editedFieldCount: _editedFields,
+                totalFieldCount: _totalFields,
+                wasEdited: _editedFields != null ? _editedFields > 0 : null
+            });
+        }
     } catch (err) {
         if (session.inTransaction()) await session.abortTransaction();
         if (err.code === 11000) {

@@ -16,6 +16,7 @@ const { normalizeGeneratedRecipe } = require('../services/recipe-draft-normalize
 const { allocateAiRecipeId } = require('../services/recipe-id.service');
 const recipeRagService = require('../services/recipe-rag.service');
 const { AI_PORTION_RULES } = require('../config/recipe-portion.rules');
+const aiMetricsService = require('../services/aiMetrics.service');
 const {
     analyzeRecipe,
     buildTodaySuggestionReasoning,
@@ -269,6 +270,8 @@ exports.getRecipeDetails = asyncHandler(async (req, res) => {
 // "Hôm nay ăn gì" dùng cùng recommendation engine; AI chỉ là fallback.
 exports.suggestTodayRecipe = asyncHandler(async (req, res) => {
     const userId = req.user.userId;
+    const sessionId = req.get('X-Request-Id') || `recipe-suggest-${Date.now()}`;
+    const startedAt = Date.now();
     // Một snapshot duy nhất cho ranking, AI context và validation trong request này.
     const inventorySnapshot = await inventoryService.loadUsableInventorySnapshot(userId);
     const rankedRecipes = await rankRecipesForInventory(userId, 400, inventorySnapshot);
@@ -286,6 +289,13 @@ exports.suggestTodayRecipe = asyncHandler(async (req, res) => {
             bestDatabaseMatch.recipe.cookingTimeMinutes,
             timeZone
         );
+        // Ghi chỉ số gợi ý từ DB (không dùng AI) — fire-and-forget
+        aiMetricsService.logRecipeAiResponse({
+            userId, sessionId,
+            latencyMs: Date.now() - startedAt,
+            usedAiFallback: false,
+            suggestionCount: 1
+        });
         return res.status(200).json({
             success: true,
             data: {
@@ -363,6 +373,14 @@ exports.suggestTodayRecipe = asyncHandler(async (req, res) => {
         
         delete suggestion.customRecipe;
     }
+
+    // Ghi chỉ số gợi ý dùng AI fallback — fire-and-forget
+    aiMetricsService.logRecipeAiResponse({
+        userId, sessionId,
+        latencyMs: Date.now() - startedAt,
+        usedAiFallback: true,
+        suggestionCount: suggestion?.recipeId ? 1 : 0
+    });
 
     console.log(`[API] ${req.method} ${req.originalUrl} - Suggest recipe success (User: ${userId})`);
     res.status(200).json({
@@ -605,6 +623,18 @@ exports.ragSuggestRecipe = asyncHandler(async (req, res) => {
 
     candidateRecipe.recipeId = await allocateAiRecipeId();
     await candidateRecipe.save();
+    
+    const sessionId = req.get('X-Request-Id') || `recipe-rag-${Date.now()}`;
+    // Ghi AI Metrics cho RAG
+    aiMetricsService.logRecipeAiResponse({
+        userId: req.user.userId,
+        sessionId,
+        latencyMs: ragMetadata.durationMs,
+        usedAiFallback: true,
+        suggestionCount: 1,
+        aiModel: ragMetadata.model
+    });
+
     console.info('[Recipe RAG]', {
         userId: req.user.userId,
         recipeId: candidateRecipe.recipeId,
@@ -796,6 +826,18 @@ exports.cookRecipe = asyncHandler(async (req, res) => {
     }
 
     console.log(`[API] ${req.method} ${req.originalUrl} - Cook recipe success (User: ${userId}, Recipe: ${recipeId})`);
+
+    // Ghi USER_CONFIRMED recipe — fire-and-forget
+    if (!resultData.replayed) {
+        aiMetricsService.logRecipeUserConfirmed({
+            userId,
+            sessionId: idempotencyKey,
+            cookSuccess: true,
+            usedAiFallback: Boolean(req.body.usedAiFallback),
+            suggestionRank: typeof req.body.suggestionRank === 'number' ? req.body.suggestionRank : null
+        });
+    }
+
     res.status(200).json({
         success: true,
         replayed: resultData.replayed,

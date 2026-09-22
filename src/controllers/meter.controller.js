@@ -18,6 +18,7 @@ const {
     allocatePayment,
     validateMeterImage
 } = require('../services/meter.service');
+const aiMetricsService = require('../services/aiMetrics.service');
 
 const PAYMENT_METHODS = new Set(['CASH', 'MOMO', 'VNPAY', 'BANK_TRANSFER', 'CREDIT_CARD']);
 
@@ -107,6 +108,14 @@ exports.recognizeReading = asyncHandler(async (req, res) => {
         ]
     });
     const value = parseMeterAiResponse(text);
+    // Ghi chỉ số AI công tơ — fire-and-forget
+    aiMetricsService.logMeterAiResponse({
+        userId: req.user?.userId,
+        sessionId: req.get('X-Request-Id') || `meter-ocr-${Date.now()}`,
+        latencyMs: metadata?.durationMs ?? null,
+        aiModel: metadata?.model ?? null,
+        aiReadingValue: value
+    });
     return res.status(200).json({
         success: true,
         data: { value, source: 'GEMINI_AI', metadata }
@@ -341,6 +350,19 @@ exports.createReading = asyncHandler(async (req, res) => {
             await next.save({ session });
         }
         await session.commitTransaction();
+
+        // Ghi USER_CONFIRMED công tơ — fire-and-forget, sau khi commit an toàn
+        // Chỉ ghi khi nguồn là OCR (có AI trước đó), MANUAL không cần đo AI
+        if (inputSource === 'OCR') {
+            aiMetricsService.logMeterUserConfirmed({
+                userId,
+                sessionId: req.get('X-Request-Id') || idempotencyKey,
+                aiReadingValue: ocrValue,
+                userReadingValue: reading.currentValue ?? null,
+                wasEdited: aiIsValueEdited,
+                inputSource
+            });
+        }
     } catch (error) {
         if (session.inTransaction()) await session.abortTransaction();
         if (error.code === 11000) {
