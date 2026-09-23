@@ -1,3 +1,4 @@
+const finance = require('../services/finance.service');
 const crypto = require('crypto');
 const mongoose = require('mongoose');
 const moment = require('moment-timezone');
@@ -439,6 +440,7 @@ exports.payMonth = asyncHandler(async (req, res) => {
     let paymentSummary;
     try {
         session.startTransaction();
+        const financeUser = await finance.lockUser(userId, session);
         const replayReading = await MeterReading.findOne({ userId, paymentIdempotencyKey: idempotencyKey }).session(session);
         if (replayReading?.transactionId) {
             replayed = true;
@@ -465,16 +467,24 @@ exports.payMonth = asyncHandler(async (req, res) => {
             const estimatedTotal = readings.reduce((sum, item) => sum + item.estimatedCost, 0);
             paymentSummary = comparePayment(estimatedTotal, req.body.paidAmount);
             const txIdempotencyKey = `meter_${crypto.createHash('sha256').update(`${userId}:${idempotencyKey}`).digest('hex')}`;
+            const utilityLabel = meterType === 'POWER' ? 'điện' : 'nước';
+            const utilityNote = `Thanh toán tiền ${utilityLabel} tháng ${month}`;
+            const balanceFields = await finance.transactionFields(financeUser, {
+                transactionType: 'EXPENSE', amount: paymentSummary.paidAmount, date: transactionDate,
+                category: 'HOUSING', note: utilityNote, merchantName: `Tiền ${utilityLabel}`,
+                fixedPayment: req.body.fixedPayment
+            }, session);
             [transaction] = await Transaction.create([{
+                ...balanceFields,
                 userId,
                 transactionType: 'EXPENSE',
                 amount: paymentSummary.paidAmount,
                 discount: 0,
-                note: `Thanh toán tiền ${meterType === 'POWER' ? 'điện' : 'nước'} tháng ${month}`,
+                note: utilityNote,
                 date: transactionDate,
                 category: 'HOUSING',
                 paymentMethod,
-                merchantName: meterType === 'POWER' ? 'Tiền điện' : 'Tiền nước',
+                merchantName: `Tiền ${utilityLabel}`,
                 idempotencyKey: txIdempotencyKey,
                 items: []
             }], { session });

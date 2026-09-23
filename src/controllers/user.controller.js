@@ -1,4 +1,5 @@
 const User = require('../models/user.model');
+const finance = require('../services/finance.service');
 const RpgLog = require('../models/rpgLog.model');
 const Recipe = require('../models/recipe.model');
 const {
@@ -15,9 +16,8 @@ exports.getProfile = async (req, res, next) => {
             return res.status(404).json({ success: false, message: 'Không tìm thấy người dùng' });
         }
 
-        // Tương thích ngược theo lần đồng bộ đầu tiên: chỉ user chưa có rpg_v2
-        // mới được tính lại, không chạy migration hàng loạt trên database.
-        if (user.rpgStats?.formulaVersion !== 'rpg_v3') {
+        // Tính lại khi đọc để ngày mới và expiry được phản ánh kể cả không có giao dịch.
+        {
             const rpgService = require('../services/rpg.service');
             const state = await rpgService.calculateUserStats(userId);
             if (state) user.rpgStats = state;
@@ -26,7 +26,7 @@ exports.getProfile = async (req, res, next) => {
         console.log(`[API] ${req.method} ${req.originalUrl} - Get profile success (User: ${userId})`);
         res.status(200).json({
             status: 'success',
-            data: { user }
+            data: { user: { ...user.toObject(), financeSnapshot: await finance.snapshot(user) } }
         });
     } catch (error) {
         next(error);
@@ -213,7 +213,7 @@ exports.updateSettings = async (req, res, next) => {
         if (monthlyBudget !== undefined) updateData.monthlyBudget = parseNonNegative(monthlyBudget, 'Ngân sách tháng');
         if (fixedBudget !== undefined) updateData.fixedBudget = parseNonNegative(fixedBudget, 'Tiền nhà cố định');
         if (essentialBudget !== undefined) updateData.essentialBudget = parseNonNegative(essentialBudget, 'Ngân sách thiết yếu');
-        if (savingsFund !== undefined) updateData.savingsFund = parseNonNegative(savingsFund, 'Quỹ tiết kiệm');
+        // savingsFund cũ chỉ là gợi ý khởi tạo; không cho settings thay đổi tiền thực.
         if (cycleStartDay !== undefined) {
             const day = Number(cycleStartDay);
             if (!Number.isInteger(day) || day < 1 || day > 28) {
@@ -224,7 +224,7 @@ exports.updateSettings = async (req, res, next) => {
             updateData.cycleStartDay = day;
         }
 
-        const currentUser = await User.findById(userId).select('monthlyBudget essentialBudget');
+        const currentUser = await User.findById(userId);
         if (!currentUser) return res.status(404).json({ success: false, message: 'Không tìm thấy người dùng' });
         const effectiveMonthly = updateData.monthlyBudget ?? currentUser.monthlyBudget;
         const effectiveEssential = updateData.essentialBudget ?? currentUser.essentialBudget;
@@ -235,7 +235,36 @@ exports.updateSettings = async (req, res, next) => {
             });
         }
 
-        let user = await User.findByIdAndUpdate(userId, updateData, { new: true, runValidators: true });
+        if (req.body.fixedPlans !== undefined) {
+            if (!Array.isArray(req.body.fixedPlans) || req.body.fixedPlans.length > 4) throw finance.fail('Danh sách khoản cố định không hợp lệ.');
+            const codes = new Set();
+            updateData['finance.fixedPlans'] = req.body.fixedPlans.map(plan => {
+                if (!finance.FIXED_LABELS[plan.code] || codes.has(plan.code)) throw finance.fail('Khoản cố định không hợp lệ hoặc trùng.');
+                codes.add(plan.code);
+                return { code: plan.code, amount: finance.money(plan.amount, 'Chi phí cố định') };
+            });
+            updateData.fixedBudget = updateData['finance.fixedPlans'].reduce((sum, plan) => sum + plan.amount, 0);
+        }
+        const settingsSession = await mongoose.startSession();
+        let user;
+        try {
+            await settingsSession.withTransaction(async () => {
+                const locked = await finance.lockUser(userId, settingsSession);
+                if (locked.finance?.initializedAt) {
+                    const currentCycle = await finance.captureCycle(locked, settingsSession);
+                    const requestedDay = cycleStartDay === undefined ? null : Number(cycleStartDay);
+                    if (requestedDay && requestedDay !== locked.cycleStartDay) {
+                        if (locked.finance.pendingCycleAt && requestedDay !== locked.finance.pendingCycleDay) {
+                            throw finance.fail('Đã có thay đổi ngày chu kỳ chờ áp dụng.');
+                        }
+                        updateData['finance.pendingCycleDay'] = requestedDay;
+                        updateData['finance.pendingCycleAt'] = locked.finance.pendingCycleAt || currentCycle.endExclusive;
+                        delete updateData.cycleStartDay;
+                    }
+                }
+                user = await User.findByIdAndUpdate(userId, updateData, { new: true, runValidators: true, session: settingsSession });
+            });
+        } finally { await settingsSession.endSession(); }
         if (!user) {
             return res.status(404).json({ success: false, message: 'Không tìm thấy người dùng' });
         }
@@ -255,7 +284,7 @@ exports.updateSettings = async (req, res, next) => {
         console.log(`[API] ${req.method} ${req.originalUrl} - Update settings success (User: ${userId})`);
         res.status(200).json({
             status: 'success',
-            data: { user }
+            data: { user: { ...user.toObject(), financeSnapshot: await finance.snapshot(user) } }
         });
     } catch (error) {
         next(error);
@@ -349,4 +378,70 @@ exports.deleteMyAccount = async (req, res, next) => {
     } catch (error) {
         next(error);
     }
+};
+
+// Khởi tạo, đối soát và chuyển quỹ dùng sổ giao dịch hiện có; không tạo reward.
+exports.updateFinance = async (req, res, next) => {
+    const session = await mongoose.startSession();
+    try {
+        const userId = req.user.userId;
+        const key = String(req.get('Idempotency-Key') || '').trim();
+        if (!key || key.length > 120) throw finance.fail('Thiếu Idempotency-Key hợp lệ.');
+        const { action } = req.body;
+        let replayed = false;
+        await session.withTransaction(async () => {
+            const user = await finance.lockUser(userId, session);
+            const previous = await Transaction.findOne({ userId, idempotencyKey: key }).session(session);
+            if (previous) { replayed = true; return; }
+            const now = new Date();
+            let cashDelta = 0, savingsDelta = 0;
+            let kind = 'ADJUSTMENT', note;
+            if (action === 'INITIALIZE') {
+                if (user.finance.initializedAt) throw finance.fail('Số dư đã được khởi tạo. Hãy dùng đối soát.', 409);
+                user.finance.initializedAt = now;
+                user.finance.openingCash = finance.money(req.body.cash, 'Tiền sinh hoạt');
+                user.finance.openingSavings = finance.money(req.body.savings, 'Quỹ dự phòng');
+                await user.save({ session });
+                const cycle = await finance.captureCycle(user, session, now);
+                const paidCodes = req.body.paidFixedCodes || [];
+                if (!Array.isArray(paidCodes) || paidCodes.some(code => !finance.FIXED_LABELS[code])) throw finance.fail('Khoản đã trả không hợp lệ.');
+                const fixedCycle = user.finance.fixedCycles.find(item => item.key === cycle.key);
+                for (const plan of fixedCycle.plans) {
+                    if (paidCodes.includes(plan.code)) plan.openingPaid = plan.amount;
+                }
+                await user.save({ session });
+                note = 'Xác nhận số dư ban đầu (không phải thu nhập)';
+            } else {
+                if (!user.finance.initializedAt) throw finance.fail('Vui lòng xác nhận số dư ban đầu trước.');
+                const state = await finance.snapshot(user, session, now);
+                if (action === 'RECONCILE') {
+                    const reason = String(req.body.reason || '').trim();
+                    if (!reason) throw finance.fail('Vui lòng nhập lý do đối soát.');
+                    cashDelta = finance.money(req.body.cash, 'Tiền sinh hoạt') - state.cash;
+                    savingsDelta = finance.money(req.body.savings, 'Quỹ dự phòng') - state.savings;
+                    note = 'Đối soát số dư: ' + reason;
+                } else if (action === 'DEPOSIT' || action === 'WITHDRAW') {
+                    const amount = finance.money(req.body.amount, 'Số tiền');
+                    if (!amount) throw finance.fail('Số tiền phải lớn hơn 0.');
+                    if (action === 'WITHDRAW' && amount > state.savings) throw finance.fail('Số tiền rút vượt quỹ dự phòng.', 409);
+                    if (action === 'DEPOSIT' && amount > state.cash) throw finance.fail('Số tiền nạp vượt tiền sinh hoạt hiện có.', 409);
+                    savingsDelta = action === 'DEPOSIT' ? amount : -amount;
+                    cashDelta = -savingsDelta;
+                    kind = 'TRANSFER';
+                    note = action === 'DEPOSIT' ? 'Nạp quỹ dự phòng DEF' : 'Rút DEF về tiền sinh hoạt';
+                } else throw finance.fail('Thao tác tài chính không hợp lệ.');
+            }
+            await Transaction.create([{ userId, transactionType: cashDelta < 0 ? 'EXPENSE' : 'INCOME',
+                amount: Math.max(Math.abs(cashDelta), Math.abs(savingsDelta)), note, date: now,
+                category: kind === 'TRANSFER' ? 'SAVINGS' : 'OTHERS', financeKind: kind,
+                cashDelta, savingsDelta, balanceTracked: action !== 'INITIALIZE', idempotencyKey: key }], { session });
+        });
+        const stats = await require('../services/rpg.service').calculateUserStats(userId);
+        if (!replayed && Number(stats?.def || 0) >= 100) {
+            await require('../services/quest.service').triggerAchievement(userId, 'MAX_DEF_ACHIEVED', 1);
+        }
+        const user = await User.findById(userId);
+        res.json({ success: true, replayed, data: { user: { ...user.toObject(), financeSnapshot: await finance.snapshot(user) } } });
+    } catch (error) { next(error); }
+    finally { await session.endSession(); }
 };

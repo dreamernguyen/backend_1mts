@@ -5,6 +5,7 @@ const RpgLog = require('../models/rpgLog.model');
 const User = require('../models/user.model');
 const MeterReading = require('../models/meterReading.model');
 const moment = require('moment-timezone');
+const finance = require('../services/finance.service');
 const { asyncHandler } = require('../middleware/errorHandler.middleware');
 const rpgService = require('../services/rpg.service');
 const questService = require('../services/quest.service');
@@ -399,6 +400,9 @@ exports.addTransaction = asyncHandler(async (req, res) => {
         transactionType, amount, discount,
         note, date, category, paymentMethod, merchantName, items
     } = normalizedDraft;
+    if (!Number.isFinite(amount) || amount <= 0) {
+        return res.status(422).json({ success: false, message: 'Số tiền giao dịch phải lớn hơn 0.' });
+    }
 
     // ngày thực tế trên hóa đơn
     const finalDate = date ? new Date(date) : new Date();
@@ -436,6 +440,11 @@ exports.addTransaction = asyncHandler(async (req, res) => {
     let pendingGamificationPush = null;
     try {
         session.startTransaction();
+        const financeUser = await finance.lockUser(userId, session);
+        const balanceFields = await finance.transactionFields(financeUser, {
+            transactionType, amount, date: finalDate, category, note, merchantName,
+            fixedPayment: req.body.fixedPayment
+        }, session);
 
         const aiLatencyMs = typeof req.body.aiLatencyMs === 'number' && req.body.aiLatencyMs >= 0 ? Math.round(req.body.aiLatencyMs) : null;
         const aiItemCount = typeof req.body.aiItemCount === 'number' && req.body.aiItemCount >= 0 ? Math.round(req.body.aiItemCount) : null;
@@ -445,6 +454,7 @@ exports.addTransaction = asyncHandler(async (req, res) => {
         [newTransaction] = await Transaction.create([{
             userId,
             transactionType,
+            ...balanceFields,
             amount: Math.round(amount),       // Khử lỗi float của JS
             discount: Math.round(discount || 0),
             note,
@@ -627,7 +637,12 @@ exports.getHistory = asyncHandler(async (req, res) => {
     const { userId } = req.params;
     const { mode, page = 1, limit = 20, period } = req.query; // ?mode=compact&period=YYYY-MM
 
-    const periodFilter = parseHistoryPeriod(period);
+    let periodFilter = parseHistoryPeriod(period);
+    if (req.query.periodMode === 'cycle') {
+        const accountUser = await User.findById(req.user.userId);
+        const bounds = finance.userCycle(accountUser);
+        periodFilter = { $gte: bounds.startDate, $lt: bounds.endExclusive };
+    }
     if (periodFilter === undefined) {
         return res.status(400).json({
             success: false,
@@ -692,6 +707,7 @@ exports.deleteTransaction = asyncHandler(async (req, res) => {
     let tx;
     try {
         await session.withTransaction(async () => {
+            const financeUser = await finance.lockUser(req.user.userId, session);
             tx = await Transaction.findById(id).session(session);
             if (!tx) {
                 const error = new Error('Không tìm thấy giao dịch cần xóa!');
@@ -704,6 +720,13 @@ exports.deleteTransaction = asyncHandler(async (req, res) => {
                 throw error;
             }
 
+            if (tx.financeKind === 'ADJUSTMENT') throw finance.fail('Bản ghi xác nhận/đối soát được giữ để truy vết. Hãy đối soát lại để điều chỉnh.', 409);
+            if (tx.financeKind === 'TRANSFER') {
+                const account = await finance.snapshot(financeUser, session);
+                if (account.savings - tx.savingsDelta < 0 || account.cash - tx.cashDelta < 0) {
+                    throw finance.fail('Không thể đảo chuyển quỹ vì tiền đã được sử dụng. Hãy nạp/rút lại số tiền phù hợp.', 409);
+                }
+            }
             await Item.deleteMany({ transactionId: id, userId: tx.userId }).session(session);
             await MeterReading.updateMany(
                 { transactionId: id, userId: tx.userId },
@@ -761,41 +784,46 @@ const survivalInsightCache = new Map();
 
 exports.getFinanceInsight = asyncHandler(async (req, res) => {
     const userId = req.user.userId;
-    const period = String(req.query.period || moment().tz('Asia/Ho_Chi_Minh').format('YYYY-MM'));
-    const dateFilter = parseHistoryPeriod(period);
+    const user = await User.findById(userId).lean();
+    if (!user) return res.status(404).json({ success: false, message: 'Không tìm thấy người dùng.' });
+    const cycleMode = req.query.periodMode === 'cycle';
+    const currentCycle = finance.userCycle(user);
+    const period = cycleMode ? currentCycle.key : String(req.query.period || moment().tz(finance.TZ).format('YYYY-MM'));
+    const dateFilter = cycleMode ? { $gte: currentCycle.startDate, $lt: currentCycle.endExclusive } : parseHistoryPeriod(period);
     if (dateFilter === undefined || dateFilter === null) {
         return res.status(400).json({ success: false, error: { code: 'INVALID_PERIOD', message: 'Tháng không hợp lệ', retryable: false, details: {} } });
     }
     const monthStart = moment(dateFilter.$gte).tz('Asia/Ho_Chi_Minh');
     const previousStart = monthStart.clone().subtract(1, 'month');
     const previousEnd = monthStart.clone();
-    const user = await User.findById(userId).lean();
-    if (!user) return res.status(404).json({ success: false, message: 'Không tìm thấy người dùng.' });
     const [current, previous, atRiskItems] = await Promise.all([
         Transaction.aggregate([
-            { $match: { userId: new mongoose.Types.ObjectId(userId), transactionType: 'EXPENSE', date: dateFilter } },
+            { $match: { userId: new mongoose.Types.ObjectId(userId), transactionType: 'EXPENSE', ...finance.NORMAL_FILTER, date: dateFilter } },
             { $group: { _id: '$category', amount: { $sum: '$amount' }, count: { $sum: 1 } } }
         ]),
         Transaction.aggregate([
-            { $match: { userId: new mongoose.Types.ObjectId(userId), transactionType: 'EXPENSE', date: { $gte: previousStart.toDate(), $lt: previousEnd.toDate() } } },
+            { $match: { userId: new mongoose.Types.ObjectId(userId), transactionType: 'EXPENSE', ...finance.NORMAL_FILTER, date: { $gte: previousStart.toDate(), $lt: previousEnd.toDate() } } },
             { $group: { _id: '$category', amount: { $sum: '$amount' } } }
         ]),
         Item.find({ userId, usageStatus: 'ACTIVE', expiryDate: { $gte: monthStart.toDate(), $lte: moment().tz('Asia/Ho_Chi_Minh').add(3, 'days').endOf('day').toDate() } })
-            .select('purchasePrice quantity originalQuantity').lean()
+            .select('purchasePrice quantity originalQuantity category expiryDate expirySource isCookedMeal').lean()
     ]);
     const categoryBreakdown = current.map(item => ({ category: item._id || 'OTHERS', amount: Math.round(item.amount), count: item.count }));
     const previousCategoryBreakdown = Object.fromEntries(previous.map(item => [item._id || 'OTHERS', Math.round(item.amount)]));
     const spent = categoryBreakdown.reduce((sum, item) => sum + item.amount, 0);
-    const inventoryAtRiskValue = atRiskItems.reduce((sum, item) => sum + (Number(item.purchasePrice) || 0) * Math.max(0, Number(item.quantity) || 0) / Math.max(1, Number(item.originalQuantity) || 1), 0);
+    const inventoryAtRiskValue = atRiskItems.reduce((sum, item) => sum + rpgService.inventoryValue(item), 0);
     const now = moment().tz('Asia/Ho_Chi_Minh');
     const isCurrentMonth = now.format('YYYY-MM') === period;
     const snapshot = financeInsightService.createSnapshot({
         period, budget: user.monthlyBudget, essentialBudget: user.essentialBudget, spent,
-        daysElapsed: isCurrentMonth ? now.date() : monthStart.daysInMonth(),
-        daysRemaining: isCurrentMonth ? monthStart.daysInMonth() - now.date() : 0,
+        daysElapsed: cycleMode ? currentCycle.daysPassed : isCurrentMonth ? now.date() : monthStart.daysInMonth(),
+        daysRemaining: cycleMode ? currentCycle.daysRemaining : isCurrentMonth ? monthStart.daysInMonth() - now.date() + 1 : 0,
         categoryBreakdown, previousCategoryBreakdown, inventoryAtRiskValue,
         rpgStats: user.rpgStats || {}, transactionCount: current.reduce((sum, item) => sum + item.count, 0)
     });
+    snapshot.periodMode = cycleMode ? 'cycle' : 'month';
+    snapshot.periodStart = dateFilter.$gte;
+    snapshot.periodEndExclusive = dateFilter.$lt;
     const cacheKey = `${userId}:${period}:${financeInsightService.hashSnapshot(snapshot)}`;
     const cached = financeInsightCache.get(cacheKey);
     if (cached && cached.expiresAt > Date.now() && req.query.refresh !== 'true') {
@@ -837,7 +865,7 @@ Tài chính hiện tại:
 - MANA: ${rpgStats.mana} VND
 - DEF: ${rpgStats.def}%
 - WIS: ${rpgStats.wis}%
-- Ngân sách tháng (Flexible): ${Math.max(0, (user.monthlyBudget || 0) - (user.fixedBudget || 0))} VND
+- Phân tích xác định từ tiền thực có (không được coi ngân sách là tiền mặt): ${JSON.stringify(rpgStats.statBreakdown)}
 
 Thực phẩm trong tủ:
 ${itemsList || 'Trống'}
@@ -883,122 +911,46 @@ exports.getSurvivalInsight = asyncHandler(async (req, res) => {
     return res.status(200).json({ success: true, data: { snapshot, insight, fallbackUsed, cached: false } });
 });
 
-const { getCycleDates } = require('../services/rpg.service');
 
 exports.getStatistics = asyncHandler(async (req, res) => {
     const userId = req.user.userId;
     const user = await User.findById(userId);
     if (!user) return res.status(404).json({ success: false, message: 'User not found' });
-    
-    // Always recalculate RPG stats to ensure latest data
-    const rpgSvc = require('../services/rpg.service');
-    const newStats = await rpgSvc.calculateUserStats(userId);
-    if (newStats) user.rpgStats = newStats;
-
-    const cycleStartDay = user.cycleStartDay || 1;
-    const { startDate, endDate, now } = getCycleDates(cycleStartDay);
-
-    // Tính toán số ngày chu kỳ (dùng moment để xử lý timezone an toàn)
-    const startM = moment(startDate).tz('Asia/Ho_Chi_Minh');
-    const endM = moment(endDate).tz('Asia/Ho_Chi_Minh');
-    const nowM = moment(now).tz('Asia/Ho_Chi_Minh');
-    
-    // endM đang trỏ đến 23:59:59 của ngày cuối chu kỳ. startM trỏ đến 00:00:00 của ngày đầu.
-    const totalDays = Math.ceil(endM.diff(startM, 'days', true));
-    let daysPassed = Math.ceil(nowM.diff(startM, 'days', true));
-    if (daysPassed < 1) daysPassed = 1;
-    if (daysPassed > totalDays) daysPassed = totalDays;
-
-    // Lấy tổng chi tiêu trong chu kỳ (spent)
-    const transactions = await Transaction.find({
-        userId,
-        date: { $gte: startDate, $lte: endDate },
-        transactionType: 'EXPENSE'
-    });
-    
-    const FIXED_EXPENSE_CATEGORIES = new Set(['HOUSING', 'ACADEMICS']);
-    let spent = 0;
-    let fixedExpense = 0;
-    transactions.forEach(t => {
-        spent += t.amount;
-        if (FIXED_EXPENSE_CATEGORIES.has(t.category)) {
-            fixedExpense += t.amount;
-        }
-    });
-
-    // Lấy giá trị wasted trong chu kỳ
-    const wastedItems = await Item.find({
-        userId,
-        usageStatus: 'WASTED',
-        updatedAt: { $gte: startDate, $lte: endDate }
-    });
-
-    let wasted = 0;
-    wastedItems.forEach(item => {
-        if (item.originalQuantity > 0) {
-            const ratio = item.quantity / item.originalQuantity;
-            wasted += (item.purchasePrice * ratio);
-        }
-    });
-
-    // Lấy inventory counts
-    const activeItemsCount = await Item.countDocuments({ userId, usageStatus: 'ACTIVE' });
-    
-    // Count expired items amongst active ones
-    const activeItems = await Item.find({ userId, usageStatus: 'ACTIVE' });
-    let expiredItemsCount = 0;
-    activeItems.forEach(item => {
-        if (item.expiryDate) {
-            const expiry = moment(item.expiryDate).tz('Asia/Ho_Chi_Minh').startOf('day');
-            const today = moment().tz('Asia/Ho_Chi_Minh').startOf('day');
-            if (expiry.isBefore(today)) {
-                expiredItemsCount++;
-            }
-        }
-    });
-
-    const fixedBudget = user.fixedBudget || 0;
-    // Ngân sách linh hoạt = Ngân sách tổng - Tiền nhà cố định
-    const flexibleTotal = Math.max(0, (user.monthlyBudget || 0) - fixedBudget);
-    // Tiền đã chi linh hoạt = Tổng chi - Tiền đã chi cho cố định
-    const flexibleSpent = Math.max(0, spent - fixedExpense);
-    const remaining = flexibleTotal - flexibleSpent;
-
-    return res.status(200).json({
-        success: true,
-        data: {
-            cycle: { 
-                startDate: startM.format('YYYY-MM-DD'), 
-                endDate: endM.format('YYYY-MM-DD'), 
-                daysPassed, 
-                totalDays 
-            },
-            budget: { 
-                total: flexibleTotal, 
-                spent: flexibleSpent, 
-                wasted: Math.round(wasted), 
-                remaining 
-            },
-            rpgStats: { 
-                hp: user.rpgStats.hp || 0, 
-                maxHp: user.rpgStats.maxHp || 100, 
-                mana: user.rpgStats.mana || 0, 
-                maxMana: user.rpgStats.maxMana || 100, 
-                def: user.rpgStats.def || 0, 
-                wis: user.rpgStats.wis || 0 
-            },
-            inventory: { 
-                activeItems: activeItemsCount, 
-                expiredItems: expiredItemsCount 
-            }
-        }
-    });
+    const rpgStats = await rpgService.calculateUserStats(userId);
+    const account = await finance.snapshot(user);
+    const monthFilter = parseHistoryPeriod(req.query.period || moment().tz(finance.TZ).format('YYYY-MM'));
+    if (!monthFilter) throw finance.fail('Tháng không hợp lệ.');
+    const bounds = req.query.periodMode === 'month'
+        ? { startDate: monthFilter.$gte, endExclusive: monthFilter.$lt }
+        : account.cycle;
+    const transactions = await Transaction.find({ userId, ...finance.NORMAL_FILTER,
+        date: { $gte: bounds.startDate, $lt: bounds.endExclusive } }).lean();
+    const spent = transactions.filter(tx => tx.transactionType === 'EXPENSE').reduce((sum, tx) => sum + tx.amount, 0);
+    const income = transactions.filter(tx => tx.transactionType === 'INCOME').reduce((sum, tx) => sum + tx.amount, 0);
+    const categories = new Map();
+    for (const tx of transactions.filter(tx => tx.transactionType === 'EXPENSE')) {
+        const entry = categories.get(tx.category) || { category: tx.category, amount: 0, count: 0 };
+        entry.amount += tx.amount; entry.count++; categories.set(tx.category, entry);
+    }
+    const active = await Item.find({ userId, usageStatus: 'ACTIVE' }).lean();
+    const wasted = await Item.find({ userId, usageStatus: 'WASTED', updatedAt: { $gte: bounds.startDate, $lt: bounds.endExclusive } }).lean();
+    res.json({ success: true, data: {
+        cycle: { ...account.cycle, startDate: moment(account.cycle.startDate).tz(finance.TZ).format('YYYY-MM-DD'), endDate: moment(account.cycle.endDate).tz(finance.TZ).format('YYYY-MM-DD') },
+        period: { mode: req.query.periodMode === 'month' ? 'month' : 'cycle', startDate: bounds.startDate, endExclusive: bounds.endExclusive },
+        finance: account,
+        budget: { total: user.monthlyBudget || 0, essentialBudget: user.essentialBudget || 0, spent, income,
+            remaining: account.cash, plannedRemaining: (user.monthlyBudget || 0) - spent,
+            wasted: Math.round(wasted.reduce((sum, item) => sum + rpgService.inventoryValue(item, new Date(), true), 0)) },
+        categoryBreakdown: [...categories.values()].sort((a,b) => b.amount-a.amount),
+        rpgStats: rpgStats || user.rpgStats,
+        inventory: { activeItems: active.length, expiredItems: active.filter(item => item.expiryDate && moment(item.expiryDate).tz(finance.TZ).startOf('day').isBefore(moment().tz(finance.TZ).startOf('day'))).length }
+    } });
 });
 
 // Thống kê chi tiêu theo tháng - GET /api/transactions/stats/monthly?limit=6
 exports.getMonthlyStats = asyncHandler(async (req, res) => {
     const userId = req.user.userId;
-    const limit = Math.min(parseInt(req.query.limit) || 6, 24);
+    const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 6, 24));
 
     // Lấy N+1 tháng để tính % thay đổi cho tháng cũ nhất
     const now = moment().tz('Asia/Ho_Chi_Minh');
@@ -1008,7 +960,7 @@ exports.getMonthlyStats = asyncHandler(async (req, res) => {
         {
             $match: {
                 userId: new mongoose.Types.ObjectId(userId),
-                transactionType: 'EXPENSE',
+                transactionType: 'EXPENSE', ...finance.NORMAL_FILTER,
                 date: { $gte: startOfQuery }
             }
         },
@@ -1048,6 +1000,7 @@ exports.getMonthlyStats = asyncHandler(async (req, res) => {
             changePercent = ((item.totalExpense - prev.totalExpense) / prev.totalExpense) * 100;
         }
         return {
+            period: `${item._id.year}-${String(item._id.month).padStart(2, '0')}`,
             year: item._id.year,
             month: item._id.month,
             label: `T${item._id.month}/${item._id.year}`,
@@ -1068,7 +1021,16 @@ exports.getMonthlyStats = asyncHandler(async (req, res) => {
     });
 
     // Chỉ trả về limit tháng gần nhất (bỏ tháng đầu nếu chỉ dùng để tính delta)
-    const trimmed = result.slice(-limit);
+    // Luôn có tháng hiện tại và các tháng trống; delta phải so đúng tháng liền trước.
+    const byPeriod = new Map(result.map(item => [item.period, item]));
+    const filled = Array.from({ length: limit + 1 }, (_, index) => {
+        const month = now.clone().subtract(limit - index, 'months');
+        const period = month.format('YYYY-MM');
+        return byPeriod.get(period) || { period, year: month.year(), month: month.month() + 1,
+            label: month.format('[T]M/YYYY'), totalExpense: 0, count: 0, categoryBreakdown: [], changePercent: null };
+    });
+    const trimmed = filled.slice(1).map((item, index) => ({ ...item,
+        changePercent: filled[index].totalExpense > 0 ? Math.round((item.totalExpense / filled[index].totalExpense - 1) * 1000) / 10 : null }));
 
     return res.status(200).json({
         success: true,

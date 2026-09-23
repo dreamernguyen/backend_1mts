@@ -4,14 +4,14 @@ const rpgStatsSchema = new mongoose.Schema({
     level: { type: Number, default: 1 },
     xp: { type: Number, default: 0 },
     maxHp: { type: Number, default: 100 },
-    hp: { type: Number, default: 100 },
+    hp: { type: Number, default: 0 },
     mana: { type: Number, default: 0 },
     def: { type: Number, default: 0 },
     wis: { type: Number, default: 50 },
     bonusWis: { type: Number, default: 0 }, // Điểm thưởng do mua sắm thông minh
     loginStreak: { type: Number, default: 0 },
     lastLoginDate: { type: Date },
-    formulaVersion: { type: String, default: 'rpg_v3' },
+    formulaVersion: { type: String, default: 'rpg_v4' },
     dataCoverage: { type: Number, default: 0, min: 0, max: 1 },
     statBreakdown: { type: mongoose.Schema.Types.Mixed, default: () => ({}) }
 }, { _id: false });
@@ -60,6 +60,27 @@ const userSchema = new mongoose.Schema(
             type: Number,
             default: 0,
             min: 0
+        },
+        // Số dư khởi tạo được người dùng xác nhận, không suy ra từ ngân sách.
+        finance: {
+            initializedAt: { type: Date, default: null },
+            openingCash: { type: Number, default: 0 },
+            openingSavings: { type: Number, default: 0, min: 0 },
+            revision: { type: Number, default: 0 },
+            pendingCycleDay: { type: Number, default: null },
+            pendingCycleAt: { type: Date, default: null },
+            fixedPlans: [{
+                _id: false,
+                code: { type: String, enum: ['RENT', 'POWER', 'WATER', 'OTHER'] },
+                amount: { type: Number, min: 0 }
+            }],
+            fixedCycles: [{
+                _id: false,
+                key: String,
+                startDate: Date,
+                endExclusive: Date,
+                plans: [{ _id: false, code: String, amount: Number, openingPaid: { type: Number, default: 0 } }]
+            }]
         },
         fixedBudget: {
             type: Number,

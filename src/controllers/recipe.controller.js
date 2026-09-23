@@ -1,3 +1,4 @@
+const rpgService = require('../services/rpg.service');
 const mongoose = require('mongoose');
 const asyncHandler = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 const Recipe = require('../models/recipe.model');
@@ -723,6 +724,7 @@ exports.cookRecipe = asyncHandler(async (req, res) => {
                 return remainingDays >= 0 && remainingDays <= 2;
             }).length;
 
+            let cookedFoodValue = 0;
             for (const entry of consumption.plan) {
                 const batch = await Item.findOne({
                     _id: entry.batchId,
@@ -743,6 +745,9 @@ exports.cookRecipe = asyncHandler(async (req, res) => {
                     invalidBatch.code = 'INVALID_BATCH_MEASURE';
                     throw invalidBatch;
                 }
+                // Giữ giá vốn thực phẩm khi chuyển từ nguyên liệu sang món chín.
+                const valuedBefore = rpgService.inventoryValue(batch);
+                cookedFoodValue += batch.quantity > 0 ? valuedBefore * (batch.quantity - remaining.quantity) / batch.quantity : 0;
                 batch.quantity = remaining.quantity;
                 batch.standardQuantity = remaining.standardQuantity;
                 if (batch.standardQuantity <= 1e-8) {
@@ -767,7 +772,7 @@ exports.cookRecipe = asyncHandler(async (req, res) => {
                 unit: 'khẩu phần',
                 standardQuantity: Number(cookedServings),
                 standardUnit: 'PIECE',
-                purchasePrice: 0,
+                purchasePrice: cookedFoodValue / Number(cookedServings),
                 expiryDate: expiry,
                 storageLocation: 'FRIDGE',
                 expirySource: 'ESTIMATED_RULE',
@@ -819,7 +824,6 @@ exports.cookRecipe = asyncHandler(async (req, res) => {
 
     let gamificationState = null;
     try {
-        const rpgService = require('../services/rpg.service');
         gamificationState = await rpgService.calculateUserStats(userId);
     } catch (error) {
         console.error('[RPG] Không thể tính lại chỉ số sau khi nấu:', error.message);

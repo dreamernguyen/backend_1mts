@@ -142,6 +142,16 @@ const transactionSchema = new Schema(
       trim: true, 
       default: '' 
     },
+    // INTERNAL không phải thu nhập/chi tiêu; các delta chỉ do server ghi.
+    financeKind: { type: String, enum: ['NORMAL', 'TRANSFER', 'ADJUSTMENT'], default: 'NORMAL' },
+    cashDelta: { type: Number, default: 0 },
+    savingsDelta: { type: Number, default: 0 },
+    balanceTracked: { type: Boolean, default: false },
+    fixedPayment: {
+      code: { type: String, enum: ['RENT', 'POWER', 'WATER', 'OTHER'] },
+      cycleKey: String,
+      closes: { type: Boolean, default: false }
+    },
 
     idempotencyKey: {
       type: String,

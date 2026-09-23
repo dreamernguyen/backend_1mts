@@ -16,12 +16,12 @@ const KNOWLEDGE_CARDS = {
     BUDGET_NOT_CONFIGURED: 'Chưa có ngân sách để tính mức chi an toàn; hãy cấu hình số tiền thiết yếu trước.',
     OVER_BUDGET: 'Chi tiêu đã vượt ngân sách kỳ này; ưu tiên các khoản thiết yếu và rà soát khoản linh hoạt.',
     LOW_REMAINING_BUDGET: 'Phần ngân sách còn lại đang thấp; chia nhỏ mức chi cho các ngày còn lại.',
-    FOOD_SPENDING_UP: 'Chi cho ăn uống tăng so với tháng trước; ưu tiên lên kế hoạch món từ đồ đang có.',
+    FOOD_SPENDING_UP: 'Chi cho ăn uống tăng so với kỳ trước; ưu tiên lên kế hoạch món từ đồ đang có.',
     HOUSING_SPENDING_UP: 'Khoản nhà ở/điện nước tăng; kiểm tra chỉ số công-tơ và hóa đơn.',
-    UTILITY_SPIKE: 'Chi phí điện nước tăng đáng kể; so sánh mức dùng với tháng trước trước khi kết luận.',
+    UTILITY_SPIKE: 'Chi phí điện nước tăng đáng kể; so sánh mức dùng với kỳ trước trước khi kết luận.',
     EXPIRING_INVENTORY_VALUE_HIGH: 'Có thực phẩm sắp hết hạn; ưu tiên dùng hoặc chế biến trước, không dùng đồ quá hạn.',
     HEALTHY_SAVING_BUFFER: 'Quỹ dự phòng đang ở mức tốt; tiếp tục duy trì nhịp chi tiêu hiện tại.',
-    INSUFFICIENT_DATA: 'Dữ liệu trong tháng còn ít, nhận định chỉ mang tính định hướng.'
+    INSUFFICIENT_DATA: 'Dữ liệu trong kỳ còn ít, nhận định chỉ mang tính định hướng.'
 };
 
 const hashSnapshot = snapshot => crypto.createHash('sha256')
@@ -70,7 +70,9 @@ const createSnapshot = input => {
         remaining,
         daysElapsed: Math.max(0, Number(input.daysElapsed) || 0),
         daysRemaining,
-        safeSpendPerDay: budget > 0 && daysRemaining > 0 ? Math.max(0, Math.floor(remaining / daysRemaining)) : null,
+        // Chênh lệch kế hoạch không chứng minh người dùng có tiền để chi.
+        safeSpendPerDay: null,
+        plannedSpendPerDay: budget > 0 && daysRemaining > 0 ? Math.max(0, Math.floor(remaining / daysRemaining)) : null,
         categoryBreakdown: input.categoryBreakdown || [],
         previousCategoryBreakdown: input.previousCategoryBreakdown || {},
         inventoryAtRiskValue: Math.max(0, Number(input.inventoryAtRiskValue) || 0),
@@ -94,7 +96,7 @@ const fallbackInsight = snapshot => {
     return {
         tone: primary.severity === 'DANGER' ? 'CAUTION' : primary.severity === 'CELEBRATE' ? 'CELEBRATE' : 'SUPPORTIVE',
         headline: KNOWLEDGE_CARDS[primary.code],
-        summary: `Nhận định dựa trên dữ liệu tháng ${snapshot.period}.`,
+        summary: `Nhận định dựa trên kế hoạch chi tiêu kỳ ${snapshot.period} (ngân sách còn lại không phải số dư thực có).`,
         highlights: snapshot.facts.slice(0, 2).map(fact => ({
             factCode: fact.code,
             message: KNOWLEDGE_CARDS[fact.code],

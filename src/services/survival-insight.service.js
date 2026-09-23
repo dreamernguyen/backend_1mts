@@ -5,7 +5,7 @@ const STAT_ORDER = ['HP', 'MANA', 'DEF', 'WIS'];
 const KNOWLEDGE_CARDS = {
     HP_UNCONFIGURED: 'Chưa đủ cấu hình ngân sách thiết yếu để đánh giá nguồn lực sinh tồn.',
     HP_VIRTUAL_HIGH: 'Cảnh báo máu ảo: HP đầy nhưng tủ lạnh trống. Hãy chuyển hóa MANA thành lương thực dự trữ thay vì ăn ngoài!',
-    HP_CRITICAL_DEF_AVAILABLE: 'BÁO ĐỘNG ĐỎ! Sinh mệnh cạn kiệt, nhưng bạn vẫn còn Quỹ dự phòng. Hãy cân nhắc "Phá giáp" để duy trì sự sống!',
+    HP_CRITICAL_DEF_AVAILABLE: 'Nguồn lực sinh hoạt đang thiếu. Bạn có thể cân nhắc rút một phần quỹ dự phòng để bù thiếu hụt.',
     HP_LOW: 'HP đang ở mức nguy hiểm. Hãy thắt lưng buộc bụng và tập trung vào nhu cầu sinh tồn tối thiểu.',
     HP_STABLE: 'Nguồn lực thiết yếu hiện đủ cho kế hoạch trong kỳ, hãy tiếp tục theo dõi chi tiêu.',
     MANA_UNCONFIGURED: 'Chưa có ngân sách linh hoạt để ước tính Mana.',
@@ -15,7 +15,7 @@ const KNOWLEDGE_CARDS = {
     DEF_UNCONFIGURED: 'Chưa có ngân sách thiết yếu để quy đổi mức quỹ dự phòng.',
     DEF_LOW: 'Quỹ dự phòng (Giáp) còn mỏng, chưa đủ sức chống chịu rủi ro lớn.',
     DEF_STABLE: 'Giáp dự phòng đang rất vững chắc.',
-    WIS_WASTE: 'Có lãng phí thực phẩm được ghi nhận. Dùng đồ quá hạn sẽ bị trừ điểm Trí tuệ.',
+    WIS_WASTE: 'Có lãng phí thực phẩm được ghi nhận. Ưu tiên dùng đồ còn hạn; không dùng thực phẩm quá hạn.',
     WIS_STABLE: 'Bạn đang quản lý tài nguyên tốt, không có khoản phạt lãng phí.',
     INSUFFICIENT_DATA: 'Dữ liệu chưa đầy đủ, nhận định chỉ mang tính định hướng.'
 };
@@ -29,7 +29,7 @@ const factForStat = (stat, value, status, breakdown, rpgStats) => {
         const required = (breakdown || []).find(item => item.code === 'REQUIRED_SURVIVAL_FUNDS')?.value || 0;
         const inventory = (breakdown || []).find(item => item.code === 'USABLE_INVENTORY_VALUE')?.value || 0;
         
-        if (value >= 90 && required > 0 && (inventory / required) < 0.1) {
+        if (rpgStats?.formulaVersion !== 'rpg_v4' && value >= 90 && required > 0 && (inventory / required) < 0.1) {
             return 'HP_VIRTUAL_HIGH';
         }
         
@@ -48,7 +48,7 @@ const factForStat = (stat, value, status, breakdown, rpgStats) => {
         if (value <= 0 && hpValue < 90) {
             return 'MANA_EMPTY_HP_DRAINING';
         }
-        if (value <= 100) {
+        if (rpgStats?.formulaVersion !== 'rpg_v4' && value <= 100) {
             return Number(value) < 50 ? 'MANA_LOW' : 'MANA_STABLE';
         }
         const isManaLow = requiredHoldCash > 0 ? value < (requiredHoldCash * 0.2) : value < 500000;
@@ -103,12 +103,16 @@ const fallbackMessageFor = item => {
             const days = Number(evidence.DAYS_REMAINING) || 0;
             const freeCash = Number(evidence.FREE_CASH) || 0;
             const inventory = Number(evidence.USABLE_INVENTORY_VALUE) || 0;
+            const totalInventory = Number(evidence.TOTAL_INVENTORY_VALUE ?? inventory) || 0;
+            const expiredInventory = Number(evidence.EXPIRED_INVENTORY_VALUE) || 0;
             const resource = freeCash + inventory;
             const pace = daily > 0 ? `Mức chi thiết yếu tham chiếu là ${formatVnd(daily)}/ngày` : 'Chưa có mức chi thiết yếu theo ngày';
-            const detailText = `(Tiền mặt: ${formatVnd(freeCash)} + Lương thực: ${formatVnd(inventory)})`;
+            const expiryNote = expiredInventory > 0
+                ? ` Trong đó ${formatVnd(expiredInventory)} đang mang ngày hết hạn; hãy tự kiểm tra an toàn trước khi dùng.` : '';
+            const detailText = `(Tiền mặt sau khoản cố định: ${formatVnd(freeCash)} + giá trị kho đóng góp: ${formatVnd(inventory)}, tổng kho đang ghi nhận ${formatVnd(totalInventory)})`;
             return item.factCode === 'HP_LOW'
-                ? `${pace}. Tổng nguồn lực ${formatVnd(resource)} ${detailText} cho ${days} ngày còn lại, nên ưu tiên khoản thiết yếu.`
-                : `${pace}. Tổng nguồn lực ${formatVnd(resource)} ${detailText} hiện đủ để theo kế hoạch ${days} ngày còn lại.`;
+                ? `${pace}. Tổng nguồn lực ${formatVnd(resource)} ${detailText} cho ${days} ngày còn lại, nên ưu tiên khoản thiết yếu.${expiryNote}`
+                : `${pace}. Tổng nguồn lực ${formatVnd(resource)} ${detailText} hiện đủ để theo kế hoạch ${days} ngày còn lại.${expiryNote}`;
         }
         case 'MANA': {
             if (item.factCode === 'MANA_UNCONFIGURED') return KNOWLEDGE_CARDS.MANA_UNCONFIGURED;
@@ -141,7 +145,7 @@ const fallbackInsight = snapshot => ({
     headline: 'Giải mã Sinh Tồn',
     summary: snapshot.dataCoverage < 1
         ? 'Một số chỉ số chưa đủ dữ liệu; hãy kiểm tra cấu hình ngân sách và giao dịch.'
-        : 'Các chỉ số được tính từ ngân sách, giao dịch, quỹ dự phòng và kho thực phẩm còn dùng được.',
+        : 'Các chỉ số được tính từ tiền thực có, kế hoạch, quỹ dự phòng và lượng thực phẩm vẫn đang ghi nhận trong kho.',
     statMessages: snapshot.stats.map(item => ({
         stat: item.stat,
         factCode: item.factCode,

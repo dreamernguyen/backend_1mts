@@ -26,6 +26,7 @@ router.put('/profile', verifyToken, userController.updateProfile);
 
 // Cập nhật Cài đặt Tài chính & Gamification
 router.put('/settings', verifyToken, userController.updateSettings);
+router.post('/finance', verifyToken, userController.updateFinance);
 
 // Xóa tài khoản (P0-03)
 router.delete('/me', verifyToken, userController.deleteMyAccount);
