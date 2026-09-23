@@ -1,13 +1,10 @@
 const Item = require('../models/item.model');
 const { usableInventory } = require('./recipe-matching.service');
+const { daysBetweenVietnamDates } = require('./vietnam-date.service');
 
 function daysRemaining(item, now = new Date()) {
     if (!item.expiryDate || item.expirySource === 'NOT_APPLICABLE') return null;
-    const start = new Date(now);
-    start.setHours(0, 0, 0, 0);
-    const expiry = new Date(item.expiryDate);
-    expiry.setHours(0, 0, 0, 0);
-    return Math.ceil((expiry - start) / 86400000);
+    return daysBetweenVietnamDates(now, item.expiryDate);
 }
 
 function createUsableInventorySnapshot(items, now = new Date()) {

@@ -4,11 +4,22 @@ const DEFAULT_TTL_MS = 5 * 60 * 1000;
 const DEFAULT_MAX_ENTRIES = 50;
 const entries = new Map();
 
-const createReceiptCacheKey = ({ userId, rawText, base64Image, promptVersion = 'receipt-v2' }) => {
+const createReceiptCacheKey = ({
+    userId,
+    rawText,
+    base64Image,
+    type = 'grocery',
+    inputMode = 'manual_text',
+    promptVersion = 'receipt-v2'
+}) => {
     const hash = crypto.createHash('sha256');
     hash.update(String(userId || 'anonymous'));
     hash.update('\u0000');
     hash.update(promptVersion);
+    hash.update('\u0000');
+    hash.update(String(type).trim().toLowerCase() || 'grocery');
+    hash.update('\u0000');
+    hash.update(String(inputMode).trim().toLowerCase() || 'manual_text');
     hash.update('\u0000');
     hash.update(rawText?.trim() || '');
     hash.update('\u0000');

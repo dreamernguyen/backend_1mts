@@ -21,6 +21,7 @@ const {
     calculateBaseUnitPrice,
     normalizeTransactionDraft,
     normalizeTransactionList,
+    normalizeUtilityDraft,
     validateExtractedReceiptTransactions,
     hasBlockingWarnings
 } = require('../services/receipt-normalizer.service');
@@ -61,6 +62,8 @@ exports.normalizeDraft = asyncHandler(async (req, res) => {
 // Bóc tách hóa đơn bằng AI
 exports.parseDocument = asyncHandler(async (req, res) => {
     const { base64Image, rawText, scanRequestId, inputSource, forceRefresh, type } = req.body;
+    const platform = ['WEB', 'ANDROID', 'IOS', 'DESKTOP'].includes(String(req.body.platform).toUpperCase())
+        ? String(req.body.platform).toUpperCase() : 'UNKNOWN';
 
     if (!base64Image && (!rawText || rawText.trim() === '')) {
         return res.status(400).json({
@@ -197,6 +200,8 @@ QUY TẮC SỐ 2: NẾU ĐỌC ĐƯỢC, BẮT BUỘC TRẢ VỀ JSON SAU:
             userId: req.user?.userId,
             rawText: cleanRawText,
             base64Image,
+            type: type === 'utility' ? 'utility' : 'grocery',
+            inputMode,
             promptVersion: 'receipt-v5-legacy-image-json'
         });
         const cached = await getOrCreateReceiptRequest(
@@ -223,15 +228,6 @@ QUY TẮC SỐ 2: NẾU ĐỌC ĐƯỢC, BẮT BUỘC TRẢ VỀ JSON SAU:
             imageBytes,
             durationMs: Date.now() - startedAt
         });
-        // Ghi chỉ số AI — fire-and-forget, không await, không ảnh hưởng response
-        aiMetricsService.logReceiptAiResponse({
-            userId: req.user?.userId,
-            sessionId: requestId,
-            latencyMs: aiMetadata?.durationMs ?? null,
-            aiModel: aiMetadata?.model ?? null,
-            cacheHit,
-            inputMode
-        });
     } catch (error) {
         console.error('[Receipt request failed]', {
             requestId,
@@ -246,7 +242,8 @@ QUY TẮC SỐ 2: NẾU ĐỌC ĐƯỢC, BẮT BUỘC TRẢ VỀ JSON SAU:
             sessionId: requestId,
             inputMode,
             errorCode: error.code || 'AI_UNAVAILABLE',
-            errorMessage: error.message
+            errorMessage: error.message,
+            platform
         });
         return res.status(error.statusCode || 503).json({
             success: false,
@@ -263,6 +260,10 @@ QUY TẮC SỐ 2: NẾU ĐỌC ĐƯỢC, BẮT BUỘC TRẢ VỀ JSON SAU:
         ocrResultData = JSON.parse(responseText);
     } catch (e) {
         if (cacheKey) deleteReceiptRequestCache(cacheKey);
+        aiMetricsService.logReceiptAiError({
+            userId: req.user?.userId, sessionId: requestId, inputMode, platform,
+            errorCode: 'AI_INVALID_JSON', errorMessage: e.message, failureStage: 'JSON_PARSE'
+        });
         console.error('Lỗi parse JSON từ AI:', responseText);
         return res.status(502).json({
             success: false,
@@ -271,19 +272,31 @@ QUY TẮC SỐ 2: NẾU ĐỌC ĐƯỢC, BẮT BUỘC TRẢ VỀ JSON SAU:
         });
     }
 
-    // Nếu là utility, trả thẳng raw AI output cho Frontend tự tạo bản nháp thay vì dùng logic đi chợ
+    // Utility cũng phải qua validator trước khi thành bản nháp UI.
     if (type === 'utility') {
-        if (ocrResultData.isReadable === false) {
+        const utilityDraft = normalizeUtilityDraft(ocrResultData);
+        if (utilityDraft.isReadable === false) {
+            if (cacheKey) deleteReceiptRequestCache(cacheKey);
+            aiMetricsService.logReceiptAiError({
+                userId: req.user?.userId, sessionId: requestId, inputMode, platform,
+                errorCode: 'UTILITY_VALIDATION_FAILED', errorMessage: utilityDraft.reason, failureStage: 'BUSINESS_VALIDATION'
+            });
             return res.status(422).json({
                 success: false,
                 code: 'RECEIPT_UNREADABLE',
-                message: ocrResultData.reason || 'Không thể đọc được ảnh hóa đơn, vui lòng chụp rõ hơn.'
+                message: utilityDraft.reason || 'Không thể đọc được ảnh hóa đơn, vui lòng chụp rõ hơn.'
             });
         }
+        aiMetricsService.logReceiptAiResponse({
+            userId: req.user?.userId, sessionId: requestId, latencyMs: aiMetadata?.durationMs ?? null,
+            endToEndLatencyMs: Date.now() - startedAt, aiModel: aiMetadata?.model ?? null,
+            cacheHit, inputMode, platform, aiItemCount: 0, aiTotalAmount: utilityDraft.amount,
+            hasWarnings: false, warningCount: 0, blockingWarningCount: 0, draft: utilityDraft
+        });
         return res.status(200).json({
             success: true,
             message: 'AI bóc tách hóa đơn tiện ích thành công!',
-            data: ocrResultData 
+            data: utilityDraft
         });
     }
 
@@ -292,6 +305,10 @@ QUY TẮC SỐ 2: NẾU ĐỌC ĐƯỢC, BẮT BUỘC TRẢ VỀ JSON SAU:
     // báo lỗi nếu ảnh mờ
     if (normalizedTransactions[0]?.isReadable === false) {
         if (cacheKey) deleteReceiptRequestCache(cacheKey);
+        aiMetricsService.logReceiptAiError({
+            userId: req.user?.userId, sessionId: requestId, inputMode, platform,
+            errorCode: 'RECEIPT_UNREADABLE', errorMessage: normalizedTransactions[0].reason, failureStage: 'BUSINESS_VALIDATION'
+        });
         return res.status(422).json({
             success: false,
             code: 'RECEIPT_UNREADABLE',
@@ -312,6 +329,10 @@ QUY TẮC SỐ 2: NẾU ĐỌC ĐƯỢC, BẮT BUỘC TRẢ VỀ JSON SAU:
             itemCounts: normalizedTransactions.map(transaction =>
                 Array.isArray(transaction.items) ? transaction.items.length : 0
             )
+        });
+        aiMetricsService.logReceiptAiError({
+            userId: req.user?.userId, sessionId: requestId, inputMode, platform,
+            errorCode: extractionValidation.code, errorMessage: extractionValidation.message, failureStage: 'BUSINESS_VALIDATION'
         });
         return res.status(422).json({
             success: false,
@@ -335,11 +356,21 @@ QUY TẮC SỐ 2: NẾU ĐỌC ĐƯỢC, BẮT BUỘC TRẢ VỀ JSON SAU:
         ))]
     });
 
-    normalizedTransactions = normalizedTransactions.map(t => ({
-        ...t,
-        aiLatencyMs: aiMetadata?.durationMs || null,
-        aiItemCount: Array.isArray(t.items) ? t.items.length : 0
-    }));
+    normalizedTransactions = normalizedTransactions.map((t, index) => {
+        const aiSessionId = `${requestId}:${index}`;
+        const warnings = Array.isArray(t.warnings) ? t.warnings : [];
+        aiMetricsService.logReceiptAiResponse({
+            userId: req.user?.userId, sessionId: aiSessionId,
+            latencyMs: aiMetadata?.durationMs ?? null, endToEndLatencyMs: Date.now() - startedAt,
+            aiModel: aiMetadata?.model ?? null, cacheHit, inputMode, platform,
+            aiItemCount: Array.isArray(t.items) ? t.items.length : 0,
+            aiTotalAmount: t.amount, hasWarnings: warnings.length > 0,
+            warningCount: warnings.length,
+            blockingWarningCount: warnings.filter(warning => warning.severity === 'error').length,
+            draft: t
+        });
+        return { ...t, aiSessionId, aiLatencyMs: aiMetadata?.durationMs || null, aiItemCount: Array.isArray(t.items) ? t.items.length : 0 };
+    });
 
     const response = {
         success: true,
@@ -555,19 +586,12 @@ exports.addTransaction = asyncHandler(async (req, res) => {
         // Ghi USER_CONFIRMED — fire-and-forget, chạy sau khi commit an toàn
         // Chỉ ghi khi có scanRequestId (tức là lần lưu có AI trước đó)
         if (req.body.scanRequestId) {
-            const _aiItemCount  = typeof aiItemCount === 'number' ? aiItemCount : null;
-            const _editedFields = typeof aiEditedFieldCount === 'number' ? aiEditedFieldCount : null;
-            // Tổng trường AI đề xuất: số item × 4 trường chính (name, qty, price, category) + 3 trường giao dịch
-            const _totalFields  = _aiItemCount != null ? _aiItemCount * 4 + 3 : null;
             aiMetricsService.logReceiptUserConfirmed({
                 userId,
                 sessionId: String(req.body.scanRequestId).slice(0, 150),
                 userItemCount: itemsToInject.length,
                 userTotalAmount: Math.round(amount),
-                aiItemCount:  _aiItemCount,
-                editedFieldCount: _editedFields,
-                totalFieldCount: _totalFields,
-                wasEdited: _editedFields != null ? _editedFields > 0 : null
+                finalDraft: normalizedDraft
             });
         }
     } catch (err) {
@@ -784,6 +808,8 @@ const survivalInsightCache = new Map();
 
 exports.getFinanceInsight = asyncHandler(async (req, res) => {
     const userId = req.user.userId;
+    const aiSessionId = req.id || `finance-insight-${Date.now()}`;
+    const insightStartedAt = Date.now();
     const user = await User.findById(userId).lean();
     if (!user) return res.status(404).json({ success: false, message: 'Không tìm thấy người dùng.' });
     const cycleMode = req.query.periodMode === 'cycle';
@@ -839,16 +865,26 @@ exports.getFinanceInsight = asyncHandler(async (req, res) => {
             prompt: `SNAPSHOT=${JSON.stringify(snapshot)}\nKNOWLEDGE_CARDS=${JSON.stringify(cards)}\nTrả {tone,headline,summary,highlights:[{factCode,message,evidenceNumbers}],actions:[{actionCode,title,reason,estimatedImpact}]}.`
         });
         const validated = financeInsightService.validateInsight(JSON.parse(ai.text), snapshot);
-        if (validated) { insight = validated; fallbackUsed = false; }
+        if (validated) {
+            insight = validated;
+            fallbackUsed = false;
+            aiMetricsService.logInsightMetric({ userId, sessionId: aiSessionId, subFeature: 'FINANCE_INSIGHT', latencyMs: ai.metadata?.durationMs ?? Date.now() - insightStartedAt, aiModel: ai.metadata?.model ?? null });
+        } else {
+            aiMetricsService.logInsightMetric({ userId, sessionId: aiSessionId, subFeature: 'FINANCE_INSIGHT', eventType: 'AI_ERROR', resultStatus: 'VALIDATION_REJECTED', latencyMs: Date.now() - insightStartedAt, error: { code: 'INVALID_INSIGHT', message: 'AI output không qua grounded validation.' } });
+        }
     } catch (error) {
         console.warn('[Finance insight] fallback:', error.code || error.message);
+        aiMetricsService.logInsightMetric({ userId, sessionId: aiSessionId, subFeature: 'FINANCE_INSIGHT', eventType: 'AI_ERROR', resultStatus: 'ERROR', latencyMs: Date.now() - insightStartedAt, error });
     }
+    if (fallbackUsed) aiMetricsService.logInsightMetric({ userId, sessionId: aiSessionId, subFeature: 'FINANCE_INSIGHT', engine: 'RULE_DB', resultStatus: 'FALLBACK', latencyMs: Date.now() - insightStartedAt });
     financeInsightCache.set(cacheKey, { insight, fallbackUsed, expiresAt: Date.now() + 5 * 60 * 1000 });
     return res.status(200).json({ success: true, data: { snapshot, insight, fallbackUsed, cached: false } });
 });
 
 exports.getAdviceInsight = asyncHandler(async (req, res) => {
     const userId = req.user.userId;
+    const aiSessionId = req.id || `general-advice-${Date.now()}`;
+    const insightStartedAt = Date.now();
     const user = await User.findById(userId).lean();
     if (!user) return res.status(404).json({ success: false, message: 'Khong tim thay nguoi dung' });
     
@@ -878,13 +914,20 @@ YÊU CẦU QUAN TRỌNG:
 `;
 
     const systemInstruction = 'Bạn là NPC Cố vấn Sinh tồn cực kỳ thông minh, hài hước, và có chút cà khịa. Đưa ra lời khuyên ngắn gọn, dễ hiểu dựa trên ngân sách và tủ lạnh của người dùng. Trả về text thuần.';
-    const advice = await geminiService.generateGeneralAdvice(systemInstruction, promptText);
-    
-    return res.status(200).json({ success: true, advice });
+    try {
+        const ai = await geminiService.generateGeneralAdvice(systemInstruction, promptText);
+        aiMetricsService.logInsightMetric({ userId, sessionId: aiSessionId, subFeature: 'GENERAL_ADVICE', latencyMs: ai.metadata?.durationMs ?? Date.now() - insightStartedAt, aiModel: ai.metadata?.model ?? null });
+        return res.status(200).json({ success: true, advice: ai.text });
+    } catch (error) {
+        aiMetricsService.logInsightMetric({ userId, sessionId: aiSessionId, subFeature: 'GENERAL_ADVICE', eventType: 'AI_ERROR', resultStatus: 'ERROR', latencyMs: Date.now() - insightStartedAt, error });
+        return res.status(error.statusCode || 503).json({ success: false, code: error.code || 'AI_UNAVAILABLE', message: 'Chưa thể tạo lời khuyên lúc này. Vui lòng thử lại.' });
+    }
 });
 
 exports.getSurvivalInsight = asyncHandler(async (req, res) => {
     const userId = req.user.userId;
+    const aiSessionId = req.id || `survival-insight-${Date.now()}`;
+    const insightStartedAt = Date.now();
     const rpgStats = await rpgService.calculateUserStats(userId);
     if (!rpgStats) return res.status(404).json({ success: false, message: 'Không tìm thấy dữ liệu sinh tồn.' });
     const snapshot = survivalInsightService.createSnapshot(rpgStats);
@@ -903,10 +946,18 @@ exports.getSurvivalInsight = asyncHandler(async (req, res) => {
             prompt: `SNAPSHOT=${JSON.stringify(snapshot)}\nKNOWLEDGE_CARDS=${JSON.stringify(cards)}\nTrả JSON thuần {headline,summary,statMessages:[{stat,factCode,message}]}; đủ HP, MANA, DEF, WIS. Diễn giải sắc bén, hài hước, phân tích mối quan hệ giữa thực phẩm trong kho và tiền tự do; giải thích rõ vì sao HP hay MANA lại giảm. Bám sát value/evidence.`
         });
         const validated = survivalInsightService.validateInsight(JSON.parse(ai.text), snapshot);
-        if (validated) { insight = validated; fallbackUsed = false; }
+        if (validated) {
+            insight = validated;
+            fallbackUsed = false;
+            aiMetricsService.logInsightMetric({ userId, sessionId: aiSessionId, subFeature: 'SURVIVAL_INSIGHT', latencyMs: ai.metadata?.durationMs ?? Date.now() - insightStartedAt, aiModel: ai.metadata?.model ?? null });
+        } else {
+            aiMetricsService.logInsightMetric({ userId, sessionId: aiSessionId, subFeature: 'SURVIVAL_INSIGHT', eventType: 'AI_ERROR', resultStatus: 'VALIDATION_REJECTED', latencyMs: Date.now() - insightStartedAt, error: { code: 'INVALID_INSIGHT', message: 'AI output không qua grounded validation.' } });
+        }
     } catch (error) {
         console.warn('[Survival insight] fallback:', error.code || error.message);
+        aiMetricsService.logInsightMetric({ userId, sessionId: aiSessionId, subFeature: 'SURVIVAL_INSIGHT', eventType: 'AI_ERROR', resultStatus: 'ERROR', latencyMs: Date.now() - insightStartedAt, error });
     }
+    if (fallbackUsed) aiMetricsService.logInsightMetric({ userId, sessionId: aiSessionId, subFeature: 'SURVIVAL_INSIGHT', engine: 'RULE_DB', resultStatus: 'FALLBACK', latencyMs: Date.now() - insightStartedAt });
     survivalInsightCache.set(cacheKey, { insight, fallbackUsed, expiresAt: Date.now() + 5 * 60 * 1000 });
     return res.status(200).json({ success: true, data: { snapshot, insight, fallbackUsed, cached: false } });
 });

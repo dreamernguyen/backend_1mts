@@ -1,3 +1,5 @@
+const { startOfVietnamDay, endOfVietnamDay, daysBetweenVietnamDates } = require('./vietnam-date.service');
+
 const RELATION_SCORE = Object.freeze({
     EXACT: 1,
     EQUIVALENT: 0.95,
@@ -197,10 +199,8 @@ function toBaseAmount(amount, unit) {
 
 function isExpired(item, now = new Date()) {
     if (!item.expiryDate || item.expirySource === 'NOT_APPLICABLE') return false;
-    const today = new Date(now);
-    today.setHours(0, 0, 0, 0);
-    const expiry = new Date(item.expiryDate);
-    expiry.setHours(23, 59, 59, 999);
+    const today = startOfVietnamDay(now);
+    const expiry = endOfVietnamDay(item.expiryDate);
     return expiry < today;
 }
 
@@ -232,11 +232,7 @@ function scaleIngredientAmount(ingredient, servings, baseServings) {
 
 function daysRemaining(item, now) {
     if (!item.expiryDate || item.expirySource === 'NOT_APPLICABLE') return null;
-    const start = new Date(now);
-    start.setHours(0, 0, 0, 0);
-    const expiry = new Date(item.expiryDate);
-    expiry.setHours(0, 0, 0, 0);
-    return Math.ceil((expiry - start) / 86400000);
+    return daysBetweenVietnamDates(now, item.expiryDate);
 }
 
 function matchIngredient(ingredient, inventory, now, rescueThresholdDays) {
@@ -305,6 +301,7 @@ function matchIngredient(ingredient, inventory, now, rescueThresholdDays) {
     }
 
     let availableAmount = 0;
+    let relationWeightedAmount = 0;
     let expiringAvailableAmount = 0;
     let bestAccepted = null;
     let bestRejected = 'NO_MATCH';
@@ -324,6 +321,7 @@ function matchIngredient(ingredient, inventory, now, rescueThresholdDays) {
         }
         const effectiveAmount = available.amount / relation.amountFactor;
         availableAmount += effectiveAmount;
+        relationWeightedAmount += effectiveAmount * relation.score;
         const remainingDays = daysRemaining(item, now);
         if (remainingDays !== null && remainingDays >= 0 && remainingDays <= rescueThresholdDays) {
             expiringAvailableAmount += effectiveAmount;
@@ -345,7 +343,11 @@ function matchIngredient(ingredient, inventory, now, rescueThresholdDays) {
     }
 
     const relation = bestAccepted?.level || bestRejected;
-    const relationScore = bestAccepted?.score || 0;
+    // Khi đủ lượng từ nhiều lô có chất lượng match khác nhau, không được lấy
+    // điểm của lô tốt nhất cho toàn bộ lượng (exact + substitute).
+    const relationScore = availableAmount > 0
+        ? Math.min(1, relationWeightedAmount / availableAmount)
+        : (bestAccepted?.score || 0);
     const quantityRatio = required.amount > 0 ? Math.min(availableAmount / required.amount, 1) : 1;
     return {
         ingredient,
@@ -419,8 +421,6 @@ function analyzeRecipe(recipeInput, items, options = {}) {
         rawFeasibleServings = 0;
     }
     const feasibleServings = normalizeServings(rawFeasibleServings, servingStep);
-    const canCook = feasibleServings >= minCookServings
-        && coreMatches.every(match => ACCEPTED_RELATIONS.has(match.relation));
 
     const missingCoreIngredients = coreMatches
         .filter(match => {
@@ -439,6 +439,11 @@ function analyzeRecipe(recipeInput, items, options = {}) {
     const reviewRequiredIngredients = ingredientMatches
         .filter(match => match.relation === 'REVIEW_REQUIRED')
         .map(match => match.ingredient);
+    // Feasibility và missing core cùng dùng scaleIngredientAmount ở trên; điều
+    // này chặn FIXED_MINIMUM dù phép ước lượng tuyến tính còn đủ khẩu phần.
+    const canCook = feasibleServings >= minCookServings
+        && coreMatches.every(match => ACCEPTED_RELATIONS.has(match.relation))
+        && missingCoreIngredients.length === 0;
 
     const scoreCoverage = matches => matches.length === 0 ? 0 : matches.reduce(
         (sum, match) => sum + (match.relationScore * match.quantityRatio),

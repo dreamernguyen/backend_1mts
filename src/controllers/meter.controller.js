@@ -96,8 +96,16 @@ exports.recognizeReading = asyncHandler(async (req, res) => {
         return res.status(413).json({ success: false, message: 'Ảnh công tơ phải nhỏ hơn hoặc bằng 4 MB.' });
     }
 
+    const aiSessionId = /^[A-Za-z0-9_-]{8,150}$/.test(String(req.body?.aiSessionId || ''))
+        ? String(req.body.aiSessionId) : `meter-ocr-${Date.now()}`;
+    const platform = ['WEB', 'ANDROID', 'IOS', 'DESKTOP'].includes(String(req.body?.platform).toUpperCase())
+        ? String(req.body.platform).toUpperCase() : 'UNKNOWN';
+    const startedAt = Date.now();
     const unit = meterType === 'POWER' ? 'kWh' : 'm³ hoặc m3';
-    const { text, metadata } = await geminiService.generateStructuredReceipt({
+    let text;
+    let metadata;
+    try {
+        ({ text, metadata } = await geminiService.generateStructuredReceipt({
         requestId: req.get('X-Request-Id') || 'meter-ocr',
         inputMode: 'meter_image',
         systemInstruction: 'Bạn là bộ đọc chỉ số công tơ. Chỉ trích xuất số nhìn thấy, không suy đoán.',
@@ -107,19 +115,28 @@ exports.recognizeReading = asyncHandler(async (req, res) => {
             },
             { inlineData: { mimeType, data: imageBase64 } }
         ]
-    });
+        }));
+    } catch (error) {
+        aiMetricsService.logMeterAiError?.({
+            userId: req.user?.userId, sessionId: aiSessionId, platform,
+            errorCode: error.code || 'AI_UNAVAILABLE', errorMessage: error.message
+        });
+        throw error;
+    }
     const value = parseMeterAiResponse(text);
     // Ghi chỉ số AI công tơ — fire-and-forget
     aiMetricsService.logMeterAiResponse({
         userId: req.user?.userId,
-        sessionId: req.get('X-Request-Id') || `meter-ocr-${Date.now()}`,
+        sessionId: aiSessionId,
         latencyMs: metadata?.durationMs ?? null,
         aiModel: metadata?.model ?? null,
-        aiReadingValue: value
+        aiReadingValue: value,
+        platform,
+        endToEndLatencyMs: Date.now() - startedAt
     });
     return res.status(200).json({
         success: true,
-        data: { value, source: 'GEMINI_AI', metadata }
+        data: { value, source: 'GEMINI_AI', aiSessionId, metadata }
     });
 });
 
@@ -237,6 +254,12 @@ exports.createReading = asyncHandler(async (req, res) => {
     const aiFallbackUsed = req.body.aiFallbackUsed === true || req.body.aiFallbackUsed === false 
         ? req.body.aiFallbackUsed 
         : null;
+    const aiSessionId = /^[A-Za-z0-9_-]{8,150}$/.test(String(req.body.aiSessionId || '')) ? String(req.body.aiSessionId) : null;
+    const ocrEngine = ['GEMINI', 'ML_KIT', 'MANUAL'].includes(String(req.body.ocrEngine).toUpperCase())
+        ? String(req.body.ocrEngine).toUpperCase() : inputSource === 'MANUAL' ? 'MANUAL' : 'UNKNOWN';
+    const clientPlatform = ['WEB', 'ANDROID', 'IOS', 'DESKTOP'].includes(String(req.body.platform).toUpperCase())
+        ? String(req.body.platform).toUpperCase() : 'UNKNOWN';
+    const fallbackChain = String(req.body.fallbackChain || '').slice(0, 120) || null;
 
     const session = await mongoose.startSession();
     let reading;
@@ -310,10 +333,15 @@ exports.createReading = asyncHandler(async (req, res) => {
                 unitPrice: meter.unitPrice,
                 inputSource,
                 ocrText,
+                ocrValue,
                 ocrWarnings,
                 aiLatencyMs,
                 aiIsValueEdited,
                 aiFallbackUsed,
+                aiSessionId,
+                ocrEngine,
+                clientPlatform,
+                fallbackChain,
                 ...image,
                 idempotencyKey
             });
@@ -330,10 +358,15 @@ exports.createReading = asyncHandler(async (req, res) => {
                 unitPrice: meter.unitPrice,
                 inputSource,
                 ocrText,
+                ocrValue,
                 ocrWarnings,
                 aiLatencyMs,
                 aiIsValueEdited,
                 aiFallbackUsed,
+                aiSessionId,
+                ocrEngine,
+                clientPlatform,
+                fallbackChain,
                 ...image,
                 idempotencyKey
             }], { session });
@@ -355,13 +388,29 @@ exports.createReading = asyncHandler(async (req, res) => {
         // Ghi USER_CONFIRMED công tơ — fire-and-forget, sau khi commit an toàn
         // Chỉ ghi khi nguồn là OCR (có AI trước đó), MANUAL không cần đo AI
         if (inputSource === 'OCR') {
+            // ML Kit chạy local nên không có endpoint recognize để ghi response.
+            // Ghi bản OCR đã được người dùng đưa vào bước confirm, không gửi lại ảnh.
+            if (ocrEngine === 'ML_KIT') {
+                aiMetricsService.logMeterAiResponse({
+                    userId,
+                    sessionId: aiSessionId || idempotencyKey,
+                    latencyMs: aiLatencyMs,
+                    aiReadingValue: ocrValue,
+                    platform: clientPlatform,
+                    engine: 'ML_KIT',
+                    fallbackChain
+                });
+            }
             aiMetricsService.logMeterUserConfirmed({
                 userId,
-                sessionId: req.get('X-Request-Id') || idempotencyKey,
+                sessionId: aiSessionId || idempotencyKey,
                 aiReadingValue: ocrValue,
                 userReadingValue: reading.currentValue ?? null,
                 wasEdited: aiIsValueEdited,
-                inputSource
+                inputSource,
+                platform: clientPlatform,
+                engine: ocrEngine,
+                fallbackChain
             });
         }
     } catch (error) {

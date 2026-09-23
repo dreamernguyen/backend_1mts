@@ -5,6 +5,7 @@ const ITEM_CATEGORIES = new Set([
 const COOKABLE_ITEM_CATEGORIES = new Set([
     'MEAT', 'SEAFOOD', 'VEGETABLE', 'FRUIT', 'EGG', 'DRY_FOOD', 'DRINK', 'SPICE'
 ]);
+const { endOfVietnamDay, addVietnamDays } = require('./vietnam-date.service');
 
 const TRANSACTION_CATEGORIES = new Set([
     'HOUSING', 'ACADEMICS', 'RESTAURANT', 'MARKET', 'CLOTHING',
@@ -344,10 +345,7 @@ function parseDate(value) {
 }
 
 function endOfDay(value) {
-    const date = parseDate(value);
-    if (!date) return null;
-    date.setHours(23, 59, 59, 999);
-    return date;
+    return endOfVietnamDay(value);
 }
 
 function includesAny(value, keywords) {
@@ -403,9 +401,9 @@ function resolveExpiry(input, context, category, subCategory, storageLocation) {
 
     // Không tin ngày ước lượng do client gửi lên: luôn tính lại theo ngày mua.
     const purchaseDate = endOfDay(context?.purchaseDate) || endOfDay(new Date());
-    purchaseDate.setDate(purchaseDate.getDate() + rule.days);
+    const expiryDate = addVietnamDays(purchaseDate, rule.days);
     return {
-        expiryDate: purchaseDate,
+        expiryDate,
         expirySource: 'ESTIMATED_RULE',
         expiryRuleCode: rule.code
     };
@@ -632,6 +630,26 @@ function normalizeTransactionDraft(input = {}) {
     const itemWarnings = items.flatMap((item, index) =>
         item.warnings.map(entry => ({ ...entry, itemIndex: index }))
     );
+    // `amount` là số tiền cuối cùng sau voucher. Chỉ đối soát những dòng có
+    // thành tiền xác định; không suy diễn các dòng thiếu giá/định lượng.
+    const itemTotals = items
+        .map(item => Number(item.totalPrice))
+        .filter(total => Number.isFinite(total) && total > 0);
+    if (category === 'MARKET' && itemTotals.length > 0 && amount > 0) {
+        const expectedAmount = Math.max(0, itemTotals.reduce((sum, total) => sum + total, 0) - discount);
+        const absoluteDelta = Math.abs(expectedAmount - amount);
+        const relativeDelta = absoluteDelta / Math.max(amount, expectedAmount, 1);
+        const tolerance = Math.max(1000, Math.max(amount, expectedAmount) * 0.02);
+        if (absoluteDelta > tolerance) {
+            const severity = absoluteDelta >= 10000 && relativeDelta >= 0.1 ? 'error' : 'warning';
+            warnings.push(warning(
+                'RECEIPT_TOTAL_MISMATCH',
+                'amount',
+                'Tổng thành tiền các mặt hàng không khớp số tiền thanh toán. Vui lòng kiểm tra lại hóa đơn.',
+                severity
+            ));
+        }
+    }
 
     return {
         isReadable: true,
@@ -657,6 +675,25 @@ function normalizeTransactionDraft(input = {}) {
 function normalizeTransactionList(value) {
     const list = Array.isArray(value) ? value : [value];
     return list.filter(entry => entry && typeof entry === 'object').map(normalizeTransactionDraft);
+}
+
+function normalizeUtilityDraft(input = {}) {
+    if (!input || typeof input !== 'object') {
+        return { isReadable: false, reason: 'AI không trả về hóa đơn tiện ích hợp lệ.' };
+    }
+    if (input.isReadable === false) {
+        return {
+            isReadable: false,
+            reason: normalizeWhitespace(input.reason) || 'Không thể đọc được hóa đơn tiện ích.'
+        };
+    }
+    const provider = normalizeWhitespace(input.provider);
+    const amount = parseMoney(input.amount, NaN);
+    const billingPeriod = normalizeWhitespace(input.billingPeriod);
+    if (!provider || !Number.isFinite(amount) || amount <= 0 || !billingPeriod) {
+        return { isReadable: false, reason: 'Dữ liệu hóa đơn tiện ích thiếu nhà cung cấp, số tiền hoặc kỳ hóa đơn.' };
+    }
+    return { isReadable: true, provider, amount, billingPeriod };
 }
 
 function validateExtractedReceiptTransactions(transactions, { inputMode = 'manual_text' } = {}) {
@@ -717,6 +754,7 @@ module.exports = {
     normalizeReceiptItem,
     normalizeTransactionDraft,
     normalizeTransactionList,
+    normalizeUtilityDraft,
     validateExtractedReceiptTransactions,
     isValidCategorySubCategory,
     resolveStorageLocation,

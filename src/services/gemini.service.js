@@ -174,18 +174,13 @@ exports.generateStructuredFinanceInsight = async ({ systemInstruction, prompt, r
 exports.generateStructuredSurvivalInsight = exports.generateStructuredFinanceInsight;
 
 exports.generateGeneralAdvice = async (systemInstruction, promptText) => {
-    try {
-        const result = await executeWithFallback({
-            systemInstruction,
-            promptParts: [{ text: promptText }],
-            timeoutMs: 8000,
-            contextName: 'General Advice'
-        });
-        return result.text;
-    } catch (error) {
-        console.error("Error generating general advice:", error);
-        return formatAiError(error, "Xin lỗi, không thể đưa ra lời khuyên: ");
-    }
+    const result = await executeWithFallback({
+        systemInstruction,
+        promptParts: [{ text: promptText }],
+        timeoutMs: 8000,
+        contextName: 'General Advice'
+    });
+    return { text: result.text, metadata: result.metadata };
 };
 
 const RECIPE_EMBEDDING_DIMENSIONS = 768;

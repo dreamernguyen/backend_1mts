@@ -32,6 +32,7 @@ const aiMetricsSchema = new mongoose.Schema({
         required: true,
         index: true
     },
+    subFeature: { type: String, trim: true, maxlength: 50, default: null },
 
     /**
      * Loại sự kiện.
@@ -50,16 +51,28 @@ const aiMetricsSchema = new mongoose.Schema({
 
     // ── Hiệu suất AI ──────────────────────────────────────────────────────
     latencyMs:  { type: Number, min: 0, default: null },
+    modelLatencyMs: { type: Number, min: 0, default: null },
+    endToEndLatencyMs: { type: Number, min: 0, default: null },
     inputMode:  { type: String, trim: true, maxlength: 50, default: null },
     // image | ocr_text | manual_text | meter_image | recipe_rag
     cacheHit:   { type: Boolean, default: null },
     aiModel:    { type: String, trim: true, maxlength: 80, default: null },
+    platform:   { type: String, enum: ['WEB', 'ANDROID', 'IOS', 'DESKTOP', 'UNKNOWN'], default: 'UNKNOWN' },
+    engine:     { type: String, enum: ['GEMINI', 'ML_KIT', 'RULE_DB', 'UNKNOWN'], default: 'UNKNOWN' },
+    fallbackChain: { type: String, trim: true, maxlength: 120, default: null },
+    resultStatus: { type: String, enum: ['SUCCESS', 'FALLBACK', 'ERROR', 'VALIDATION_REJECTED'], default: null },
+    failureStage: { type: String, trim: true, maxlength: 80, default: null },
 
     // ── Output AI (tại lúc AI trả — eventType = AI_RESPONSE) ─────────────
     aiItemCount:    { type: Number, min: 0, default: null }, // hóa đơn: số item trích được
     aiTotalAmount:  { type: Number, min: 0, default: null }, // hóa đơn: tổng tiền AI đọc
     aiReadingValue: { type: Number, min: 0, default: null }, // công tơ: chỉ số AI đọc
     hasWarnings:    { type: Boolean, default: null },        // AI có trả warnings không
+    warningCount: { type: Number, min: 0, default: null },
+    blockingWarningCount: { type: Number, min: 0, default: null },
+    // Snapshot đã chuẩn hóa, tối thiểu cho việc đối chiếu khi user xác nhận.
+    // Không lưu ảnh, prompt hay raw OCR.
+    receiptSnapshot: { type: mongoose.Schema.Types.Mixed, default: null },
 
     // ── Chỉnh sửa của user (tại lúc user xác nhận — eventType = USER_CONFIRMED) ──
     userItemCount:    { type: Number, min: 0, default: null },
@@ -84,6 +97,8 @@ const aiMetricsSchema = new mongoose.Schema({
     // ── Recipe / Gợi ý ───────────────────────────────────────────────────
     suggestionCount:  { type: Number, min: 0, default: null }, // số gợi ý trả về
     suggestionRank:   { type: Number, min: 1, default: null }, // user chọn gợi ý thứ mấy
+    recipeId: { type: String, trim: true, maxlength: 160, default: null },
+    recommendationSource: { type: String, trim: true, maxlength: 40, default: null },
     usedAiFallback:   { type: Boolean, default: null },        // có gọi Gemini không
     cookSuccess:      { type: Boolean, default: null },        // trừ kho thành công
 

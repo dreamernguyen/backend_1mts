@@ -34,11 +34,23 @@ function normalizeGeneratedRecipe(input, defaults = {}) {
         if (!name || !Number.isFinite(amount) || amount <= 0 || !VALID_UNITS.has(unit)) {
             throw validationError(`Nguyên liệu AI thứ ${index + 1} không hợp lệ.`);
         }
+        const requestedScalingMode = compact(item?.scalingMode).toUpperCase();
+        const hasRequestedScalingMode = ['PROPORTIONAL', 'WHOLE_UNIT', 'FIXED_MINIMUM', 'NON_SCALABLE'].includes(requestedScalingMode);
+        const scalingMode = hasRequestedScalingMode
+            ? requestedScalingMode
+            : unit === 'PIECE' ? 'WHOLE_UNIT' : null;
+        const wholeUnitStep = Number(item?.wholeUnitStep);
         return {
             name,
             amount,
             unit,
-            required: Boolean(item?.required ?? item?.isCore)
+            required: Boolean(item?.required ?? item?.isCore),
+            ...(scalingMode ? {
+                scalingMode,
+                wholeUnitStep: scalingMode === 'WHOLE_UNIT' && Number.isFinite(wholeUnitStep) && wholeUnitStep > 0
+                    ? wholeUnitStep
+                    : scalingMode === 'WHOLE_UNIT' ? 1 : null
+            } : {})
         };
     });
     if (ingredients.length === 0 || !ingredients.some(item => item.required)) {

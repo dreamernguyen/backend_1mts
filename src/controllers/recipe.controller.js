@@ -295,7 +295,9 @@ exports.suggestTodayRecipe = asyncHandler(async (req, res) => {
             userId, sessionId,
             latencyMs: Date.now() - startedAt,
             usedAiFallback: false,
-            suggestionCount: 1
+            suggestionCount: 1,
+            recipeId: bestDatabaseMatch.recipe.recipeId,
+            recommendationSource: 'RULE_DB'
         });
         return res.status(200).json({
             success: true,
@@ -311,6 +313,9 @@ exports.suggestTodayRecipe = asyncHandler(async (req, res) => {
                 matchScore: bestDatabaseMatch.analysis.matchScore,
                 feasibleServings: bestDatabaseMatch.analysis.feasibleServings,
                 suggestedMeal: mealContext.code,
+                recommendationSessionId: sessionId,
+                recommendationSource: 'RULE_DB',
+                recommendationRank: 1,
                 rotationReset
             }
         });
@@ -380,13 +385,20 @@ exports.suggestTodayRecipe = asyncHandler(async (req, res) => {
         userId, sessionId,
         latencyMs: Date.now() - startedAt,
         usedAiFallback: true,
-        suggestionCount: suggestion?.recipeId ? 1 : 0
+        suggestionCount: suggestion?.recipeId ? 1 : 0,
+        recipeId: suggestion?.recipeId || null,
+        recommendationSource: 'GEMINI_FALLBACK'
     });
 
     console.log(`[API] ${req.method} ${req.originalUrl} - Suggest recipe success (User: ${userId})`);
     res.status(200).json({
         success: true,
-        data: suggestion
+        data: suggestion?.recipeId ? {
+            ...suggestion,
+            recommendationSessionId: sessionId,
+            recommendationSource: 'GEMINI_FALLBACK',
+            recommendationRank: 1
+        } : suggestion
     });
 });
 
@@ -484,6 +496,8 @@ Trả về CHỈ JSON, không giải thích thêm.
 // JSON có provenance, sau đó matcher kiểm tra lại đủ lượng/đơn vị/expiry.
 // AI draft được lưu DRAFT để có thể xem/nấu, nhưng không lẫn vào catalog chính.
 exports.ragSuggestRecipe = asyncHandler(async (req, res) => {
+    const recommendationSessionId = /^[A-Za-z0-9_-]{8,150}$/.test(String(req.body?.recommendationSessionId || ''))
+        ? String(req.body.recommendationSessionId) : `recipe-rag-${Date.now()}`;
     let query;
     try {
         query = recipeRagService.normalizeQuery(req.body?.query);
@@ -542,7 +556,7 @@ exports.ragSuggestRecipe = asyncHandler(async (req, res) => {
                     candidates: retrieval.candidates
                 })
             }],
-            requestId: `recipe-rag-${Date.now()}`,
+            requestId: recommendationSessionId,
             inputMode: 'recipe_rag'
         });
     } catch (error) {
@@ -625,15 +639,16 @@ exports.ragSuggestRecipe = asyncHandler(async (req, res) => {
     candidateRecipe.recipeId = await allocateAiRecipeId();
     await candidateRecipe.save();
     
-    const sessionId = req.get('X-Request-Id') || `recipe-rag-${Date.now()}`;
     // Ghi AI Metrics cho RAG
     aiMetricsService.logRecipeAiResponse({
         userId: req.user.userId,
-        sessionId,
+        sessionId: recommendationSessionId,
         latencyMs: ragMetadata.durationMs,
         usedAiFallback: true,
         suggestionCount: 1,
-        aiModel: ragMetadata.model
+        aiModel: ragMetadata.model,
+        recipeId: candidateRecipe.recipeId,
+        recommendationSource: 'RAG_GEMINI'
     });
 
     console.info('[Recipe RAG]', {
@@ -651,6 +666,9 @@ exports.ragSuggestRecipe = asyncHandler(async (req, res) => {
             reasoning: envelope.reasoning,
             sourceRecipeIds: envelope.baseRecipeIds,
             recipe: decorateRecipe(candidateRecipe, analysis),
+            recommendationSessionId,
+            recommendationSource: 'RAG_GEMINI',
+            recommendationRank: 1,
             rag: ragMetadata
         }
     });
@@ -661,6 +679,8 @@ exports.cookRecipe = asyncHandler(async (req, res) => {
     const userId = req.user.userId;
     const { recipeId, cookedServings, idempotencyKey: bodyIdempotencyKey } = req.body;
     const idempotencyKey = String(req.get('Idempotency-Key') || bodyIdempotencyKey || '').trim();
+    const recommendationSessionId = /^[A-Za-z0-9_-]{8,150}$/.test(String(req.body.recommendationSessionId || ''))
+        ? String(req.body.recommendationSessionId) : null;
 
     if (!idempotencyKey || idempotencyKey.length > 120) {
         return res.status(400).json({
@@ -835,10 +855,11 @@ exports.cookRecipe = asyncHandler(async (req, res) => {
     if (!resultData.replayed) {
         aiMetricsService.logRecipeUserConfirmed({
             userId,
-            sessionId: idempotencyKey,
+            sessionId: recommendationSessionId || idempotencyKey,
             cookSuccess: true,
-            usedAiFallback: Boolean(req.body.usedAiFallback),
-            suggestionRank: typeof req.body.suggestionRank === 'number' ? req.body.suggestionRank : null
+            usedAiFallback: ['GEMINI_FALLBACK', 'RAG_GEMINI'].includes(String(req.body.recommendationSource)),
+            suggestionRank: Number.isInteger(req.body.recommendationRank) && req.body.recommendationRank > 0 ? req.body.recommendationRank : null,
+            recipeId
         });
     }
 

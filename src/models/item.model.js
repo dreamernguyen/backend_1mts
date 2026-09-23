@@ -1,4 +1,5 @@
 const mongoose = require("mongoose");
+const { daysBetweenVietnamDates } = require('../services/vietnam-date.service');
 const Schema = mongoose.Schema;
 
 const itemSchema = new Schema(
@@ -103,6 +104,14 @@ const itemSchema = new Schema(
       trim: true,
       default: null,
     },
+    // Với phần lô bị vứt, bản ghi WASTED là ledger bất biến và vẫn truy ngược
+    // được về lô ACTIVE đã bị giảm lượng.
+    wasteSourceItemId: {
+      type: Schema.Types.ObjectId,
+      ref: "Item",
+      required: false,
+      default: null,
+    },
     cookIdempotencyKey: {
       type: String,
       trim: true,
@@ -171,11 +180,7 @@ itemSchema.virtual("daysRemaining").get(function () {
   if (!this.expiryDate || this.expirySource === "NOT_APPLICABLE") {
     return null;
   }
-  const now = new Date();
-  const expiry = new Date(this.expiryDate);
-  now.setHours(0, 0, 0, 0);
-  expiry.setHours(0, 0, 0, 0);
-  return Math.ceil((expiry.getTime() - now.getTime()) / (1000 * 3600 * 24));
+  return daysBetweenVietnamDates(new Date(), this.expiryDate);
 });
 
 // Phân loại trạng thái hạn dựa trên ngày còn lại

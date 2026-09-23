@@ -13,6 +13,7 @@ const {
     resolveStorageLocation,
     resolveExpiry
 } = require('../services/receipt-normalizer.service');
+const { startOfVietnamDay, endOfVietnamDay } = require('../services/vietnam-date.service');
 
 function escapeRegExp(value) {
     return String(value ?? '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -20,6 +21,22 @@ function escapeRegExp(value) {
 
 function exactNameRegex(value) {
     return new RegExp(`^${escapeRegExp(value)}$`, 'i');
+}
+
+function createWasteLedgerEntry(batch, quantity, standardQuantity, financialWaste) {
+    const source = batch.toObject();
+    delete source._id;
+    delete source.__v;
+    return {
+        ...source,
+        wasteSourceItemId: batch._id,
+        quantity,
+        originalQuantity: quantity,
+        standardQuantity,
+        purchasePrice: financialWaste,
+        baseUnitPrice: standardQuantity > 0 ? financialWaste / standardQuantity : 0,
+        usageStatus: 'WASTED'
+    };
 }
 
 // Thêm vật phẩm mới vào kho
@@ -170,15 +187,14 @@ exports.getListExpiring = asyncHandler(async (req, res) => {
     const daysThreshold = 2; // Ngưỡng cảnh báo: ≤ 2 ngày còn lại
 
     // Tính mốc cuối ngày thứ 2 kể từ hôm nay
-    const targetDate = new Date();
-    targetDate.setDate(targetDate.getDate() + daysThreshold);
-    targetDate.setHours(23, 59, 59, 999);
+    const today = startOfVietnamDay(new Date());
+    const targetDate = endOfVietnamDay(new Date(today.getTime() + daysThreshold * 86400000));
 
     const items = await Item.find({
         userId: new mongoose.Types.ObjectId(userId), 
         usageStatus: 'ACTIVE',
         category: { $in: ['MEAT', 'SEAFOOD', 'VEGETABLE', 'FRUIT', 'EGG', 'DRINK'] }, // Chỉ thực phẩm ăn được
-        expiryDate: { $lte: targetDate } // Bao gồm cả đồ đã hết hạn (âm ngày)
+        expiryDate: { $gte: today, $lte: targetDate }
     }).sort({ expiryDate: 1 });
 
     console.log(`[API] ${req.method} ${req.originalUrl} - Get expiring items success (User: ${userId}, Count: ${items.length})`);
@@ -197,6 +213,15 @@ exports.consumeRecipe = asyncHandler(async (_req, res) => res.status(410).json({
 exports.consumeManual = asyncHandler(async (req, res) => {
     const { id } = req.params;
     const { consumeQuantity } = req.body;
+    const requestedQuantity = Number(consumeQuantity);
+
+    if (!Number.isFinite(requestedQuantity) || requestedQuantity <= 0) {
+        return res.status(400).json({
+            success: false,
+            code: 'INVALID_CONSUMPTION',
+            message: 'Số lượng cần dùng phải là số hữu hạn lớn hơn 0.'
+        });
+    }
 
     const item = await Item.findById(id);
 
@@ -212,21 +237,30 @@ exports.consumeManual = asyncHandler(async (req, res) => {
         });
     }
 
-    // quy đổi lượng cần trừ
-    const unitRatio = item.standardQuantity / item.quantity;
-    const standardConsume = consumeQuantity * unitRatio;
-
-    // bọc $set/$inc tránh lỗi document replacement
-    let updateFields;
-    if (item.quantity <= consumeQuantity) {
-        // trừ quá kho -> thành CONSUMED
-        updateFields = { $set: { quantity: 0, standardQuantity: 0, usageStatus: 'CONSUMED' } };
-    } else {
-        // trừ 1 phần bằng $inc
-        updateFields = { $inc: { quantity: -consumeQuantity, standardQuantity: -standardConsume } };
+    if (requestedQuantity > item.quantity) {
+        return res.status(400).json({ success: false, code: 'INSUFFICIENT_QUANTITY', message: 'Số lượng cần dùng vượt quá lượng còn lại.' });
     }
 
-    const updatedData = await Item.findByIdAndUpdate(id, updateFields, { new: true });
+    // quantity là đơn vị thao tác thủ công. Chỉ quy đổi standardQuantity khi
+    // lô có định lượng chuẩn xác định; update có điều kiện chặn race làm âm kho.
+    const unitRatio = Number(item.standardQuantity) > 0 ? Number(item.standardQuantity) / Number(item.quantity) : 0;
+    const standardConsume = requestedQuantity * unitRatio;
+    const updatedData = await Item.findOneAndUpdate(
+        { _id: id, userId: req.user.userId, usageStatus: 'ACTIVE', quantity: { $gte: requestedQuantity } },
+        [
+            {
+                $set: {
+                    quantity: { $max: [0, { $subtract: ['$quantity', requestedQuantity] }] },
+                    standardQuantity: { $max: [0, { $subtract: ['$standardQuantity', standardConsume] }] }
+                }
+            },
+            { $set: { usageStatus: { $cond: [{ $lte: ['$quantity', 0] }, 'CONSUMED', 'ACTIVE'] } } }
+        ],
+        { new: true }
+    );
+    if (!updatedData) {
+        return res.status(409).json({ success: false, code: 'CONSUMPTION_CONFLICT', message: 'Lượng tồn đã thay đổi, vui lòng kiểm tra và thử lại.' });
+    }
 
     console.log(`[API] ${req.method} ${req.originalUrl} - Consume manual success (Item: ${id})`);
     return res.status(200).json({
@@ -591,6 +625,7 @@ exports.batchUpdate = asyncHandler(async (req, res) => {
         let totalWastedValue = 0;
         let wastedItemName = currentItem.itemName;
         let hasWasted = false;
+        const wasteLedgerItems = [];
 
         for (const consume of consumptions) {
             if (!consume.batchIds || consume.batchIds.length === 0) continue;
@@ -612,7 +647,14 @@ exports.batchUpdate = asyncHandler(async (req, res) => {
                 userId: new mongoose.Types.ObjectId(userId),
                 usageStatus: 'ACTIVE',
                 quantity: { $gt: 0 }
-            }).sort({ expiryDate: 1, createdAt: 1 }).session(session);
+            }).sort({ createdAt: 1 }).session(session);
+            // MongoDB sắp null trước Date khi sort tăng dần. FEFO cần đưa lô
+            // không theo dõi hạn xuống cuối, rồi mới dùng createdAt làm tie-break.
+            activeBatches.sort((left, right) => {
+                const leftExpiry = left.expiryDate ? new Date(left.expiryDate).getTime() : Number.MAX_SAFE_INTEGER;
+                const rightExpiry = right.expiryDate ? new Date(right.expiryDate).getTime() : Number.MAX_SAFE_INTEGER;
+                return leftExpiry - rightExpiry;
+            });
 
             if (activeBatches.length > 0) {
                 const firstIsSingle = activeBatches[0].standardUnit === 'PIECE';
@@ -641,9 +683,16 @@ exports.batchUpdate = asyncHandler(async (req, res) => {
                 if (isSingle) {
                     // Trừ theo quantity (VD: số lượng lon)
                     const deductedQty = Math.min(batch.quantity, neededQty);
+                    const deductedStdQty = deductedQty / ratio;
                     if (consume.isWasted && deductedQty > 0) {
-                        totalWastedValue += (deductedQty / batch.originalQuantity) * batch.purchasePrice;
+                        const financialWaste = (deductedQty / batch.originalQuantity) * batch.purchasePrice;
+                        totalWastedValue += financialWaste;
                         hasWasted = true;
+                        if (deductedQty < batch.quantity) {
+                            wasteLedgerItems.push(createWasteLedgerEntry(
+                                batch, deductedQty, deductedStdQty, financialWaste
+                            ));
+                        }
                     }
 
                     const finalStatus = consume.isWasted ? 'WASTED' : 'CONSUMED';
@@ -675,10 +724,17 @@ exports.batchUpdate = asyncHandler(async (req, res) => {
                     }
                 } else {
                     // Trừ theo standardQuantity (VD: số ml sữa)
-                    const deductedQty = Math.min(batch.quantity, neededQty); // still can use quantity for value ratio
-                    if (consume.isWasted && deductedQty > 0) {
-                        totalWastedValue += (deductedQty / batch.originalQuantity) * batch.purchasePrice;
+                    const deductedStdQty = Math.min(batch.standardQuantity, neededStdQty);
+                    const deductedQty = Number((deductedStdQty * ratio).toFixed(8));
+                    if (consume.isWasted && deductedStdQty > 0) {
+                        const financialWaste = (deductedQty / batch.originalQuantity) * batch.purchasePrice;
+                        totalWastedValue += financialWaste;
                         hasWasted = true;
+                        if (deductedStdQty < batch.standardQuantity) {
+                            wasteLedgerItems.push(createWasteLedgerEntry(
+                                batch, deductedQty, deductedStdQty, financialWaste
+                            ));
+                        }
                     }
 
                     const finalStatus = consume.isWasted ? 'WASTED' : 'CONSUMED';
@@ -725,6 +781,9 @@ exports.batchUpdate = asyncHandler(async (req, res) => {
 
         if (bulkOps.length > 0) {
             await Item.bulkWrite(bulkOps, { session });
+        }
+        if (wasteLedgerItems.length > 0) {
+            await Item.create(wasteLedgerItems, { session });
         }
 
         let createdRpgLogId = null;

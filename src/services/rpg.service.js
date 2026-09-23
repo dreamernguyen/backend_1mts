@@ -170,5 +170,8 @@ exports.inventoryValue = (item, now = new Date(), includeWaste = false) => {
     if (!item.isCookedMeal && !food.has(item.category)) return 0;
     // HP phản ánh lượng thực phẩm còn ghi nhận trong kho. Hạn mặc định có thể lệch thực tế;
     // chỉ ngừng tính khi người dùng dùng hết hoặc chuyển trạng thái vứt bỏ.
+    // Bản ghi WASTED là event ledger: purchasePrice đã là giá trị phần bị vứt,
+    // không nhân lại số lượng của phần đó.
+    if (includeWaste && item.usageStatus === 'WASTED') return toAmount(item.purchasePrice);
     return toAmount(item.purchasePrice) * toAmount(item.quantity);
 };
