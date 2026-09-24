@@ -246,6 +246,17 @@ function toBaseMeasure(measure) {
     return measure;
 }
 
+function readMeasureFromPurchaseUnit(item) {
+    const quantity = parseDecimal(item.quantity, 0);
+    const unit = foldVietnamese(normalizeUnit(item.unit));
+    if (quantity <= 0) return null;
+    if (unit === 'kg') return { quantity: quantity * 1000, unit: 'G' };
+    if (unit === 'g') return { quantity, unit: 'G' };
+    if (unit === 'l') return { quantity: quantity * 1000, unit: 'ML' };
+    if (unit === 'ml') return { quantity, unit: 'ML' };
+    return null;
+}
+
 function normalizeMeasure(item, warnings, { requireConfirmation = false } = {}) {
     let standardQuantity = parseDecimal(item.standardQuantity, 0);
     let standardUnit = normalizeWhitespace(item.standardUnit).toUpperCase();
@@ -274,6 +285,24 @@ function normalizeMeasure(item, warnings, { requireConfirmation = false } = {}) 
         standardUnit = 'ML';
     }
 
+    // Hóa đơn hàng cân thường ghi quantity dạng kg thập phân (0,350 hoặc
+    // 0.350). Cặp quantity + unit là bằng chứng xác định, nên dùng nó để sửa
+    // trường hợp AI giữ 0.350 nhưng gắn nhầm standardUnit=G thành 0.350 gram.
+    const purchaseMeasure = readMeasureFromPurchaseUnit(item);
+    if (purchaseMeasure && (
+        standardQuantity <= 0
+        || standardUnit !== purchaseMeasure.unit
+        || !nearlyEqual(standardQuantity, purchaseMeasure.quantity)
+    )) {
+        standardQuantity = purchaseMeasure.quantity;
+        standardUnit = purchaseMeasure.unit;
+        warnings.push(warning(
+            'MEASURE_DERIVED_FROM_PURCHASE_UNIT',
+            'standardQuantity',
+            'Định lượng chuẩn được quy đổi từ số lượng và đơn vị kg/g/l/ml trên hóa đơn.'
+        ));
+    }
+
     if (standardQuantity <= 0 || !['G', 'ML', 'PIECE'].includes(standardUnit)) {
         standardQuantity = 1;
         standardUnit = 'PIECE';
@@ -289,8 +318,7 @@ function normalizeMeasure(item, warnings, { requireConfirmation = false } = {}) 
         warnings.push(warning(
             'MEASUREMENT_CONFIRMATION_REQUIRED',
             'standardQuantity',
-            'Thực phẩm chưa có định lượng rõ ràng. Vui lòng xác nhận định lượng trước khi lưu.',
-            'error'
+            'Thực phẩm chưa có định lượng rõ ràng; hệ thống đang lưu theo đơn vị mua và cần người dùng kiểm tra khi sử dụng.'
         ));
     } else {
         measurementStatus = 'CONFIRMED';

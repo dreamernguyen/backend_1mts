@@ -132,7 +132,7 @@ QUY TẮC SỐ 2: NẾU ĐỌC ĐƯỢC, BẮT BUỘC TRẢ VỀ JSON SAU:
         "transactionType": "EXPENSE",
         "category": "Chọn đúng 1 trong: HOUSING | ACADEMICS | RESTAURANT | MARKET | CLOTHING | TRANSPORT | HEALTHCARE | ENTERTAINMENT | SAVINGS | APPLIANCES | OTHERS",
         "amount": Tổng tiền thực tế sau giảm giá (Number - không lấy thập phân),
-        "discount": Số tiền giảm giá/voucher/khuyến mãi trên hóa đơn (Number, không có thì là 0),
+        "discount": Tổng giảm giá cấp hóa đơn chưa được phản ánh trong lineTotal của từng item (Number, không có thì là 0),
         "date": "Ngày mua trên hóa đơn định dạng 'YYYY-MM-DD'. NẾU HÓA ĐƠN KHÔNG GHI NĂM, BẮT BUỘC SỬ DỤNG NĂM HIỆN TẠI LÀ ${new Date().getFullYear()}. Tuyệt đối không tự đoán năm cũ. Không tìm thấy ngày thì trả về null",
         "note": "Ghi chú tóm tắt hành vi bằng tiếng Việt có dấu (VD: 'Mua sắm thực phẩm WinMart', 'Ăn sáng phở bò')",
         "items": [
@@ -159,7 +159,11 @@ QUY TẮC SỐ 2: NẾU ĐỌC ĐƯỢC, BẮT BUỘC TRẢ VỀ JSON SAU:
     - Không đưa dòng VAT, voucher, tổng cộng, tiền khách đưa/tiền thừa hoặc mã hàng thành item.
     - Mảng "items" CHỈ có phần tử khi category = "MARKET", các loại khác để mảng rỗng [].
     - amount = Tổng tiền THỰC TẾ THANH TOÁN (đã trừ discount trên bill - lấy số tiền cuối cùng user phải trả).
+    - discount: đọc các dòng "giảm giá", "voucher", "coupon", "chiết khấu", "tiết kiệm" ở phần tổng kết. Không lấy VAT, tiền khách đưa, tiền thừa hoặc điểm tích lũy làm discount. Nếu hóa đơn có "Tổng giảm giá" thì ưu tiên đúng số đó, không cộng lặp các dòng chi tiết đã nằm trong tổng.
+    - Đối soát tiền: tổng lineTotal của các item - discount phải xấp xỉ amount. Nếu lineTotal in trên bill đã là giá sau giảm riêng từng món thì không được trừ khoản giảm của món đó thêm lần nữa vào discount.
     - PHÂN BIỆT quantity và standardQuantity: "500g" hoặc "0.5kg" là định lượng, KHÔNG phải 500 sản phẩm. Ví dụ một phần thịt 500g: quantity=1, unit="Phần", standardQuantity=500, standardUnit="G".
+    - DẤU THẬP PHÂN HÀNG CÂN: "0,350 kg" và "0.350 kg" đều là 0.35 kg = 350g; "1,250 kg" và "1.250 kg" trong ngữ cảnh khối lượng đều là 1.25 kg = 1250g. Không đọc thành 350 hoặc 1.250 sản phẩm.
+    - Dấu chấm trong giá tiền Việt Nam là phân cách hàng nghìn: "99.000 đ/kg" là 99.000 đồng/kg. Ví dụ "0.350 x 99.000 = 34.650" phải trả quantity=1, unit="Phần", standardQuantity=350, standardUnit="G", purchasePrice=34650, lineTotal=34650.
     - standardQuantity luôn là TỔNG lượng của cả dòng hàng. Ví dụ 2 gói, mỗi gói 500g: quantity=2, unit="Gói", standardQuantity=1000, standardUnit="G".
     - Không suy đoán khối lượng/thể tích phổ biến. Ví dụ "mua ức gà 50 nghìn" không cho biết số gram: standardQuantity=0, standardUnit="" để ứng dụng yêu cầu người dùng xác nhận.
     - Với hàng cân có dạng "0.500 x 99.000 = 49.500": quantity=1, unit="Phần", standardQuantity=500, standardUnit="G", purchasePrice=49500, lineTotal=49500.
@@ -202,7 +206,7 @@ QUY TẮC SỐ 2: NẾU ĐỌC ĐƯỢC, BẮT BUỘC TRẢ VỀ JSON SAU:
             base64Image,
             type: type === 'utility' ? 'utility' : 'grocery',
             inputMode,
-            promptVersion: 'receipt-v5-legacy-image-json'
+            promptVersion: 'receipt-v6-discount-decimal-measure'
         });
         const cached = await getOrCreateReceiptRequest(
             cacheKey,
