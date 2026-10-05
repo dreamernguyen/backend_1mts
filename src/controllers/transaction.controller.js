@@ -26,6 +26,7 @@ const {
     hasBlockingWarnings
 } = require('../services/receipt-normalizer.service');
 const aiMetricsService = require('../services/aiMetrics.service');
+const { comparePurchases } = require('../services/receipt-price-comparison.service');
 
 const parseHistoryPeriod = period => {
     if (period == null || String(period).trim() === '') return null;
@@ -75,6 +76,8 @@ exports.parseDocument = asyncHandler(async (req, res) => {
     const requestId = typeof scanRequestId === 'string' && /^[a-zA-Z0-9_-]{8,100}$/.test(scanRequestId)
         ? scanRequestId
         : `receipt_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+    const attemptId = typeof req.body.attemptId === 'string' && /^[A-Za-z0-9_.:-]{1,140}$/.test(req.body.attemptId)
+        ? req.body.attemptId : `${requestId}_ai`;
     const cleanRawText = rawText?.trim() || '';
     const inputMode = base64Image ? 'image' : inputSource === 'OCR_TEXT' ? 'ocr_text' : 'manual_text';
     const lineCount = cleanRawText ? cleanRawText.split(/\r?\n/).filter(Boolean).length : 0;
@@ -133,7 +136,7 @@ QUY TẮC SỐ 2: NẾU ĐỌC ĐƯỢC, BẮT BUỘC TRẢ VỀ JSON SAU:
         "category": "Chọn đúng 1 trong: HOUSING | ACADEMICS | RESTAURANT | MARKET | CLOTHING | TRANSPORT | HEALTHCARE | ENTERTAINMENT | SAVINGS | APPLIANCES | OTHERS",
         "amount": Tổng tiền thực tế sau giảm giá (Number - không lấy thập phân),
         "discount": Tổng giảm giá cấp hóa đơn chưa được phản ánh trong lineTotal của từng item (Number, không có thì là 0),
-        "date": "Ngày mua trên hóa đơn định dạng 'YYYY-MM-DD'. NẾU HÓA ĐƠN KHÔNG GHI NĂM, BẮT BUỘC SỬ DỤNG NĂM HIỆN TẠI LÀ ${new Date().getFullYear()}. Tuyệt đối không tự đoán năm cũ. Không tìm thấy ngày thì trả về null",
+        "date": "Ngày mua định dạng YYYY-MM-DD khi có đủ ngày/tháng/năm. Không có năm hoặc không đọc được thì trả null và cảnh báo MISSING_RECEIPT_DATE; không tự điền năm",
         "note": "Ghi chú tóm tắt hành vi bằng tiếng Việt có dấu (VD: 'Mua sắm thực phẩm WinMart', 'Ăn sáng phở bò')",
         "items": [
             {
@@ -143,8 +146,9 @@ QUY TẮC SỐ 2: NẾU ĐỌC ĐƯỢC, BẮT BUỘC TRẢ VỀ JSON SAU:
                 "subCategory": "BẮT BUỘC trả về ĐÚNG 1 trong các MÃ CODE sau (Tuyệt đối không dùng tiếng Việt): PORK | BEEF | CHICKEN | DUCK | GOOSE | PROCESSED_MEAT | OTHER_MEAT | FISH | SHRIMP | SQUID_OCTOPUS | CRAB_SHELLFISH | OTHER_SEAFOOD | LEAFY_VEG | ROOT_VEG | MUSHROOM | HERB_SPICE_VEG | OTHER_VEG | CITRUS | TROPICAL | TEMPERATE | OTHER_FRUIT | MILK | WATER | SODA_JUICE | COFFEE_TEA | ALCOHOL | NOODLE_PASTA | RICE_GRAIN | BASIC_SPICE | SAUCE | OTHER. Rất quan trọng để phân loại tủ đồ.",
                 "quantity": Số lượng mua (Number),
                 "originalQuantity": Số lượng ban đầu - luôn bằng với quantity tại thời điểm mua (Number),
-                "unit": "Đơn vị hiển thị (BẮT BUỘC CHỈ DÙNG: 'g', 'kg', 'ml', 'L', 'Trái/Quả', 'Cái', 'Phần', 'Khay', 'Vỉ', 'Lon', 'Chai', 'Gói', 'Bó'). Ưu tiên dùng 'Trái/Quả' thay vì 'cái/phần' nếu là trứng/trái cây.",
+                "unit": "Đơn vị hiển thị (BẮT BUỘC CHỈ DÙNG: 'g', 'kg', 'ml', 'L', 'Trái/Quả', 'Cái', 'Phần', 'Khay', 'Vỉ', 'Lon', 'Chai', 'Gói', 'Bó', 'Túi', 'Hộp', 'Combo'). Ưu tiên dùng 'Trái/Quả' thay vì 'cái/phần' nếu là trứng/trái cây.",
                 "standardQuantity": TỔNG định lượng quy đổi của toàn bộ quantity trên dòng hàng (VD: 2 khay, mỗi khay 500g -> 1000; chai 1L -> 1000; 10 quả trứng -> 10). Nếu input không nói rõ thì trả 0, không được tự đoán,
+                "measurementBasis": { "scope": "PER_PURCHASE_UNIT hoặc TOTAL khi có bằng chứng", "quantity": "Định lượng của một đơn vị mua hoặc tổng dòng theo scope", "unit": "G | KG | ML | L | PIECE", "evidence": "Trích NGUYÊN VĂN cụm định lượng xác định từ tên hàng. Không có bằng chứng thì null" },
                 "standardUnit": "Đơn vị quy chuẩn: G | ML | PIECE. Luôn đổi KG sang G và L sang ML. Nếu thiếu bằng chứng định lượng thì trả chuỗi rỗng",
                 "purchasePrice": Đơn giá của 1 đơn vị unit, không phân bổ voucher tổng. Ví dụ 2 gói có lineTotal 89.000đ và không có đơn giá riêng thì purchasePrice = 44.500đ; lineTotal vẫn là 89.000đ. Không đủ bằng chứng thì trả về 0,
                 "lineTotal": Thành tiền THỰC TẾ của riêng dòng hàng trên hóa đơn (Number). Với hàng cân theo kg/g, đây là số tiền sau khi nhân trọng lượng với đơn giá/kg. Không dùng tổng toàn hóa đơn,
@@ -159,14 +163,21 @@ QUY TẮC SỐ 2: NẾU ĐỌC ĐƯỢC, BẮT BUỘC TRẢ VỀ JSON SAU:
     - Không đưa dòng VAT, voucher, tổng cộng, tiền khách đưa/tiền thừa hoặc mã hàng thành item.
     - Mảng "items" CHỈ có phần tử khi category = "MARKET", các loại khác để mảng rỗng [].
     - amount = Tổng tiền THỰC TẾ THANH TOÁN (đã trừ discount trên bill - lấy số tiền cuối cùng user phải trả).
-    - discount: đọc các dòng "giảm giá", "voucher", "coupon", "chiết khấu", "tiết kiệm" ở phần tổng kết. Không lấy VAT, tiền khách đưa, tiền thừa hoặc điểm tích lũy làm discount. Nếu hóa đơn có "Tổng giảm giá" thì ưu tiên đúng số đó, không cộng lặp các dòng chi tiết đã nằm trong tổng.
+    - discount chỉ gồm khoản thực sự trừ khỏi tổng lineTotal ở bước thanh toán (voucher, điểm sử dụng). Không lấy tổng "đã tiết kiệm", giá gạch ngang, điểm tích lũy, VAT, tiền khách đưa hoặc tiền thừa. Điểm sử dụng 1.000đ giảm tổng 335.630đ thành thanh toán 334.630đ thì discount=1000.
     - Đối soát tiền: tổng lineTotal của các item - discount phải xấp xỉ amount. Nếu lineTotal in trên bill đã là giá sau giảm riêng từng món thì không được trừ khoản giảm của món đó thêm lần nữa vào discount.
-    - PHÂN BIỆT quantity và standardQuantity: "500g" hoặc "0.5kg" là định lượng, KHÔNG phải 500 sản phẩm. Ví dụ một phần thịt 500g: quantity=1, unit="Phần", standardQuantity=500, standardUnit="G".
+    - Giữ số liệu mua nguyên bản: hàng cân 0,394kg giá 64.800đ/kg thành tiền 25.531đ -> quantity=0.394, unit="kg", purchasePrice=64800, standardQuantity=394, standardUnit="G", lineTotal=25531. Backend sẽ chuyển sang Phần. SL:500g -> quantity=500, unit="g", standardQuantity=500; đơn giá/g chỉ suy ra khi đủ bằng chứng.
+    - Hàng bao bì 2 túi 500g -> quantity=2, unit="Túi", standardQuantity=1000. Combo 3 trái mua 2 combo -> quantity=2, unit="Combo", standardQuantity=6, standardUnit="PIECE". Không lấy "trái từ 300g trở lên" làm khối lượng chính xác.
+    - Phân biệt định lượng bao bì với giới hạn kích cỡ: "Ổi 1kg (trái từ 220g)" mua 2 túi vẫn là tổng 2000G; measurementBasis={scope:"PER_PURCHASE_UNIT",quantity:1,unit:"KG",evidence:"1kg"}. "Đùi gà góc tư 500g" mua 2 túi là 1000G; góc tư là phần thịt, không phải từ 500g trở lên. Chỉ có "đùi gà từ 500g trở lên" thì chưa biết khối lượng thật. Không lấy giá tiền hoặc cột sau dấu | làm khối lượng.
+    - measurementBasis phải trích bằng chứng thật; scope TOTAL chỉ khi có chữ tổng khối lượng/định lượng. Nếu đã trả tổng standardQuantity thì không nhân số gói lần nữa. Bắp mỹ/ngô là VEGETABLE/OTHER_VEG; không gán TROPICAL chỉ vì bán theo trái.
+    - Định lượng "khoảng", "từ ... trở lên", "71g/72g" là mơ hồ; để standardQuantity=0 nếu không có bằng chứng khác. Giá gạch ngang chỉ là giá cũ, dùng giá bán hiện tại. VAT đã gồm trong giá không cộng thêm.
+    - Trên ảnh đơn hàng, tiền đậm của mỗi món là thành tiền; số gạch ngang nhỏ bên dưới là thành tiền cũ, không phải đơn giá. SL dạng 0.738 là khối lượng kg nếu bán theo cân. Ví dụ Táo SL:0.738, tiền đậm 13.173đ, tiền gạch ngang 18.819đ: lineTotal=13173, quantity=0.738, unit=Kg; thiếu đơn giá thì để null, không lấy giá cũ. Nếu không phân biệt được hai giá, cảnh báo kiểm tra giá thay vì chọn số lớn hơn.
+    - Phiếu mua hàng/voucher/quảng cáo không phải item kho. Quà tặng thực phẩm có thể chưa giao: giữ item với requiresDeliveryConfirmation=true, giá0 chỉ khi thể hiện miễn phí. Không gộp hai dòng cùng tên thành một dòng.
+    - Ảnh bị cắt không thấy tổng cuối: không bịa amount từ phần nhìn thấy, trả amount=0 và warning thiếu tổng. Năm thiếu: không tự điền.
     - DẤU THẬP PHÂN HÀNG CÂN: "0,350 kg" và "0.350 kg" đều là 0.35 kg = 350g; "1,250 kg" và "1.250 kg" trong ngữ cảnh khối lượng đều là 1.25 kg = 1250g. Không đọc thành 350 hoặc 1.250 sản phẩm.
-    - Dấu chấm trong giá tiền Việt Nam là phân cách hàng nghìn: "99.000 đ/kg" là 99.000 đồng/kg. Ví dụ "0.350 x 99.000 = 34.650" phải trả quantity=1, unit="Phần", standardQuantity=350, standardUnit="G", purchasePrice=34650, lineTotal=34650.
+    - Dấu chấm trong giá tiền Việt Nam là phân cách nghìn: 99.000đ/kg là 99000đ/kg; giữ quantity=0.350, unit="kg", purchasePrice=99000, lineTotal=34650.
     - standardQuantity luôn là TỔNG lượng của cả dòng hàng. Ví dụ 2 gói, mỗi gói 500g: quantity=2, unit="Gói", standardQuantity=1000, standardUnit="G".
     - Không suy đoán khối lượng/thể tích phổ biến. Ví dụ "mua ức gà 50 nghìn" không cho biết số gram: standardQuantity=0, standardUnit="" để ứng dụng yêu cầu người dùng xác nhận.
-    - Với hàng cân có dạng "0.500 x 99.000 = 49.500": quantity=1, unit="Phần", standardQuantity=500, standardUnit="G", purchasePrice=49500, lineTotal=49500.
+    - Hàng cân "0.500 x 99.000 = 49.500": quantity=0.5, unit="kg", standardQuantity=500, standardUnit="G", purchasePrice=99000, lineTotal=49500.
     - purchasePrice của từng item là đơn giá GHI TRÊN BILL, KHÔNG trừ voucher tổng. Cho phép sum(items × qty) > amount nếu có voucher tổng bị trừ ở dòng cuối.
     - TUYỆT ĐỐI CHỈ trả về JSON thuần, KHÔNG bọc kết quả trong thẻ markdown \`\`\`json.
     - JSON BẮT BUỘC PHẢI HỢP LỆ (Dấu ngoặc kép bao quanh TẤT CẢ các keys và chuỗi string).
@@ -206,7 +217,7 @@ QUY TẮC SỐ 2: NẾU ĐỌC ĐƯỢC, BẮT BUỘC TRẢ VỀ JSON SAU:
             base64Image,
             type: type === 'utility' ? 'utility' : 'grocery',
             inputMode,
-            promptVersion: 'receipt-v6-discount-decimal-measure'
+            promptVersion: 'receipt-v9-sale-price-layout'
         });
         const cached = await getOrCreateReceiptRequest(
             cacheKey,
@@ -214,7 +225,9 @@ QUY TẮC SỐ 2: NẾU ĐỌC ĐƯỢC, BẮT BUỘC TRẢ VỀ JSON SAU:
                 systemInstruction,
                 promptParts,
                 requestId,
-                inputMode
+                inputMode,
+                totalDeadlineMs: typeof req.body.receiptBudgetMs === 'number' && Number.isFinite(req.body.receiptBudgetMs)
+                    ? Math.max(1000, Math.min(115000, req.body.receiptBudgetMs)) : 115000
             }),
             { bypassCache: forceRefresh === true }
         );
@@ -243,7 +256,9 @@ QUY TẮC SỐ 2: NẾU ĐỌC ĐƯỢC, BẮT BUỘC TRẢ VỀ JSON SAU:
         // Ghi lỗi AI — fire-and-forget
         aiMetricsService.logReceiptAiError({
             userId: req.user?.userId,
-            sessionId: requestId,
+            sessionId: requestId, operationId: type === 'utility' ? undefined : requestId, attemptId,
+            providerAttempts: error.providerAttempts || error.metadata?.providerAttempts || error.metadata?.attempts,
+            endToEndLatencyMs: Date.now() - startedAt,
             inputMode,
             errorCode: error.code || 'AI_UNAVAILABLE',
             errorMessage: error.message,
@@ -266,6 +281,9 @@ QUY TẮC SỐ 2: NẾU ĐỌC ĐƯỢC, BẮT BUỘC TRẢ VỀ JSON SAU:
         if (cacheKey) deleteReceiptRequestCache(cacheKey);
         aiMetricsService.logReceiptAiError({
             userId: req.user?.userId, sessionId: requestId, inputMode, platform,
+            operationId: type === 'utility' ? undefined : requestId, attemptId,
+            providerAttempts: cacheHit ? [] : (aiMetadata?.providerAttempts || aiMetadata?.attempts),
+            endToEndLatencyMs: Date.now() - startedAt,
             errorCode: 'AI_INVALID_JSON', errorMessage: e.message, failureStage: 'JSON_PARSE'
         });
         console.error('Lỗi parse JSON từ AI:', responseText);
@@ -304,13 +322,23 @@ QUY TẮC SỐ 2: NẾU ĐỌC ĐƯỢC, BẮT BUỘC TRẢ VỀ JSON SAU:
         });
     }
 
-    let normalizedTransactions = normalizeTransactionList(ocrResultData);
+    const rawTransactions = (Array.isArray(ocrResultData) ? ocrResultData : [ocrResultData]).map((draft, draftIndex) => ({
+        ...draft,
+        items: Array.isArray(draft?.items) ? draft.items.map((item, lineIndex) => ({
+            ...item, sourceLineId: `${attemptId}:${draftIndex}:${lineIndex}`
+        })) : []
+    }));
+    let normalizedTransactions = normalizeTransactionList(rawTransactions);
+    const rawByNormalized = new Map(normalizedTransactions.map((draft, index) => [draft, rawTransactions[index]]));
 
     // báo lỗi nếu ảnh mờ
     if (normalizedTransactions[0]?.isReadable === false) {
         if (cacheKey) deleteReceiptRequestCache(cacheKey);
         aiMetricsService.logReceiptAiError({
             userId: req.user?.userId, sessionId: requestId, inputMode, platform,
+            operationId: type === 'utility' ? undefined : requestId, attemptId,
+            providerAttempts: cacheHit ? [] : (aiMetadata?.providerAttempts || aiMetadata?.attempts),
+            endToEndLatencyMs: Date.now() - startedAt,
             errorCode: 'RECEIPT_UNREADABLE', errorMessage: normalizedTransactions[0].reason, failureStage: 'BUSINESS_VALIDATION'
         });
         return res.status(422).json({
@@ -336,6 +364,9 @@ QUY TẮC SỐ 2: NẾU ĐỌC ĐƯỢC, BẮT BUỘC TRẢ VỀ JSON SAU:
         });
         aiMetricsService.logReceiptAiError({
             userId: req.user?.userId, sessionId: requestId, inputMode, platform,
+            operationId: type === 'utility' ? undefined : requestId, attemptId,
+            providerAttempts: cacheHit ? [] : (aiMetadata?.providerAttempts || aiMetadata?.attempts),
+            endToEndLatencyMs: Date.now() - startedAt,
             errorCode: extractionValidation.code, errorMessage: extractionValidation.message, failureStage: 'BUSINESS_VALIDATION'
         });
         return res.status(422).json({
@@ -371,9 +402,14 @@ QUY TẮC SỐ 2: NẾU ĐỌC ĐƯỢC, BẮT BUỘC TRẢ VỀ JSON SAU:
             aiTotalAmount: t.amount, hasWarnings: warnings.length > 0,
             warningCount: warnings.length,
             blockingWarningCount: warnings.filter(warning => warning.severity === 'error').length,
-            draft: t
+            draft: t, rawDraft: rawByNormalized.get(t),
+            operationId: requestId, attemptId, draftId: aiSessionId,
+            providerAttempts: cacheHit || index > 0 ? [] : (aiMetadata?.providerAttempts || aiMetadata?.attempts),
+            modelLatencyMs: cacheHit ? 0 : aiMetadata?.modelDurationMs,
+            tokenUsage: cacheHit || index > 0 ? undefined : aiMetadata,
+            eventId: `${requestId}:${attemptId}:${index}:response`
         });
-        return { ...t, aiSessionId, aiLatencyMs: aiMetadata?.durationMs || null, aiItemCount: Array.isArray(t.items) ? t.items.length : 0 };
+        return { ...t, operationId: requestId, selectedAttemptId: attemptId, draftId: aiSessionId, aiSessionId, aiLatencyMs: aiMetadata?.durationMs || null, aiItemCount: Array.isArray(t.items) ? t.items.length : 0 };
     });
 
     const response = {
@@ -444,7 +480,8 @@ exports.addTransaction = asyncHandler(async (req, res) => {
 
     // Chuẩn bị mảng Items để bơm sang kho (chỉ khi là giao dịch đi chợ MARKET)
     const itemsToInject = (category === 'MARKET' && Array.isArray(items) && items.length > 0)
-        ? items.map(item => ({
+        ? items.filter(item => item.inventoryEligible !== false &&
+            (!item.requiresDeliveryConfirmation || item.deliveryConfirmed === true)).map(item => ({
             userId,
             transactionId: null,         // Sẽ được gán sau khi có _id của transaction
             rawName: item.rawName,
@@ -458,7 +495,7 @@ exports.addTransaction = asyncHandler(async (req, res) => {
             standardQuantity: item.standardQuantity,
             standardUnit: item.standardUnit,
             isSingleUse: item.standardUnit === 'PIECE',
-            purchasePrice: Math.round(item.purchasePrice),
+            purchasePrice: item.purchasePrice,
             baseUnitPrice: calculateBaseUnitPrice(item),
             storageLocation: item.storageLocation,
             expiryDate: item.expiryDate,
@@ -512,31 +549,20 @@ exports.addTransaction = asyncHandler(async (req, res) => {
             }));
             await Item.insertMany(itemsWithTxId, { session });
 
-            // So sánh giá mua thông minh (Gamification)
-            let totalSavedAmount = 0;
-            let bonusWisToGive = 0;
-            const gamificationMessages = [];
-
-            for (const item of itemsWithTxId) {
-                if (item.baseUnitPrice > 0 && item.standardUnit) {
-                    const lastPurchase = await Item.findOne({
-                        userId,
-                        itemName: item.itemName,
-                        standardUnit: item.standardUnit,
-                        transactionId: { $ne: newTransaction._id }
-                    }).sort({ createdAt: -1 }).session(session);
-
-                    if (lastPurchase && lastPurchase.baseUnitPrice > item.baseUnitPrice) {
-                        const priceDiff = lastPurchase.baseUnitPrice - item.baseUnitPrice;
-                        const savedAmount = priceDiff * (item.standardQuantity || item.quantity);
-                        if (savedAmount > 0) {
-                            totalSavedAmount += savedAmount;
-                            bonusWisToGive += 1;
-                            gamificationMessages.push(`Mua ${item.itemName} rẻ hơn, tiết kiệm ${Math.round(savedAmount)}đ.`);
-                        }
-                    }
-                }
-            }
+            // One bounded history query; original transaction quantities do not shrink with consumption.
+            const history = await Transaction.find({
+                userId, category: 'MARKET', date: { $lte: finalDate }, _id: { $ne: newTransaction._id },
+                'items.itemName': { $in: [...new Set(itemsToInject.map(item => item.itemName))] }
+            }).sort({ date: -1, createdAt: -1 }).limit(100).select('items date').session(session).lean();
+            const priceComparison = comparePurchases(items.filter(item => item.inventoryEligible !== false &&
+                (!item.requiresDeliveryConfirmation || item.deliveryConfirmed === true)), history);
+            const totalSavedAmount = priceComparison.savedAmount;
+            const bonusWisToGive = priceComparison.wisBonus;
+            const gamificationMessages = priceComparison.details.map(detail => {
+                const scale = detail.standardUnit === 'PIECE' ? 1 : 100;
+                const label = detail.standardUnit === 'PIECE' ? 'đơn vị' : detail.standardUnit === 'G' ? '100g' : '100ml';
+                return `Mua ${detail.itemName} rẻ hơn ${Math.round((detail.previousPrice - detail.currentPrice) * scale)}đ/${label}, tiết kiệm ${Math.round(detail.savedAmount)}đ.`;
+            });
 
             if (bonusWisToGive > 0) {
                 await User.findByIdAndUpdate(userId, {
@@ -545,6 +571,7 @@ exports.addTransaction = asyncHandler(async (req, res) => {
                 gamificationRewards = {
                     savedAmount: Math.round(totalSavedAmount),
                     wisBonus: bonusWisToGive,
+                    priceComparisons: priceComparison.details,
                     message: gamificationMessages.join(' ') + ` (+${bonusWisToGive} WIS)`
                 };
                 newTransaction.gamificationRewards = gamificationRewards;
@@ -595,7 +622,13 @@ exports.addTransaction = asyncHandler(async (req, res) => {
                 sessionId: String(req.body.scanRequestId).slice(0, 150),
                 userItemCount: itemsToInject.length,
                 userTotalAmount: Math.round(amount),
-                finalDraft: normalizedDraft
+                finalDraft: normalizedDraft,
+                operationId: req.body.operationId,
+                selectedAttemptId: req.body.selectedAttemptId,
+                draftId: req.body.draftId || req.body.scanRequestId,
+                eventId: `receipt_confirmed_${newTransaction._id}`,
+                businessRef: { type: 'Transaction', id: String(newTransaction._id) },
+                timeToConfirmMs: req.body.timeToConfirmMs
             });
         }
     } catch (err) {

@@ -7,7 +7,6 @@ const MeterReading = require('../models/meterReading.model');
 const Transaction = require('../models/transaction.model');
 const rpgService = require('../services/rpg.service');
 const questService = require('../services/quest.service');
-const geminiService = require('../services/gemini.service');
 const { asyncHandler } = require('../middleware/errorHandler.middleware');
 const {
     meterUnit,
@@ -20,6 +19,7 @@ const {
     validateMeterImage
 } = require('../services/meter.service');
 const aiMetricsService = require('../services/aiMetrics.service');
+const meterAiService = require('../services/meter-ai.service');
 
 const PAYMENT_METHODS = new Set(['CASH', 'MOMO', 'VNPAY', 'BANK_TRANSFER', 'CREDIT_CARD']);
 
@@ -88,12 +88,24 @@ exports.recognizeReading = asyncHandler(async (req, res) => {
     const imageBase64 = String(req.body?.imageBase64 || '')
         .replace(/^data:image\/(?:jpeg|jpg|png);base64,/i, '')
         .replace(/\s/g, '');
-    if (!['image/jpeg', 'image/jpg', 'image/png'].includes(mimeType) || !imageBase64) {
+    if (!['image/jpeg', 'image/jpg', 'image/png'].includes(mimeType) || !imageBase64
+        || !/^[A-Za-z0-9+/]+={0,2}$/.test(imageBase64) || imageBase64.length % 4 === 1) {
         return res.status(400).json({ success: false, message: 'Ảnh công tơ không hợp lệ.' });
     }
     const imageBytes = Buffer.from(imageBase64, 'base64');
     if (!imageBytes.length || imageBytes.length > 4 * 1024 * 1024) {
         return res.status(413).json({ success: false, message: 'Ảnh công tơ phải nhỏ hơn hoặc bằng 4 MB.' });
+    }
+    const contextImageBase64 = req.body?.contextImageBase64;
+    const contextMimeType = String(req.body?.contextMimeType || 'image/jpeg').toLowerCase();
+    if (contextImageBase64 !== undefined && (typeof contextImageBase64 !== 'string'
+        || !['image/jpeg', 'image/png'].includes(contextMimeType)
+        || !/^[A-Za-z0-9+/]+={0,2}$/.test(contextImageBase64)
+        || contextImageBase64.length % 4 === 1)) {
+        return res.status(400).json({ success: false, message: 'Ảnh toàn cảnh không hợp lệ.' });
+    }
+    if (contextImageBase64 && imageBytes.length + Buffer.from(contextImageBase64, 'base64').length > 4 * 1024 * 1024) {
+        return res.status(413).json({ success: false, message: 'Tổng ảnh công tơ phải nhỏ hơn hoặc bằng 4 MB.' });
     }
 
     const aiSessionId = /^[A-Za-z0-9_-]{8,150}$/.test(String(req.body?.aiSessionId || ''))
@@ -101,42 +113,49 @@ exports.recognizeReading = asyncHandler(async (req, res) => {
     const platform = ['WEB', 'ANDROID', 'IOS', 'DESKTOP'].includes(String(req.body?.platform).toUpperCase())
         ? String(req.body.platform).toUpperCase() : 'UNKNOWN';
     const startedAt = Date.now();
-    const unit = meterType === 'POWER' ? 'kWh' : 'm³ hoặc m3';
-    let text;
-    let metadata;
+    const operationId = /^[A-Za-z0-9_-]{8,150}$/.test(String(req.body?.operationId || ''))
+        ? String(req.body.operationId) : null;
+    const attemptId = /^[A-Za-z0-9_-]{8,150}$/.test(String(req.body?.attemptId || ''))
+        ? String(req.body.attemptId) : aiSessionId;
+    const parentAttemptId = /^[A-Za-z0-9_-]{8,150}$/.test(String(req.body?.parentAttemptId || ''))
+        ? String(req.body.parentAttemptId) : null;
+    const budgetMs = Math.max(1, Math.min(Number(req.body?.remainingBudgetMs) || 8000, 10000));
+    const abortController = new AbortController();
+    const onClose = () => { if (!res.writableEnded) abortController.abort(); };
+    res.on('close', onClose);
+    let result;
     try {
-        ({ text, metadata } = await geminiService.generateStructuredReceipt({
-        requestId: req.get('X-Request-Id') || 'meter-ocr',
-        inputMode: 'meter_image',
-        systemInstruction: 'Bạn là bộ đọc chỉ số công tơ. Chỉ trích xuất số nhìn thấy, không suy đoán.',
-        promptParts: [
-            {
-                text: `Đọc chỉ số công tơ ${meterType === 'POWER' ? 'điện' : 'nước'} trong ảnh. Đơn vị mong đợi: ${unit}. Bỏ qua serial, điện áp, vòng/kWh, mã thiết bị và năm. Trả về đúng JSON {"reading": number|null}. Nếu không chắc chắn, trả {"reading": null}.`
-            },
-            { inlineData: { mimeType, data: imageBase64 } }
-        ]
-        }));
+        result = await meterAiService.recognizeMeter({
+            meterType, imageBase64, mimeType, candidates: req.body?.candidates,
+            budgetMs, signal: abortController.signal, contextImageBase64, contextMimeType
+        });
     } catch (error) {
-        aiMetricsService.logMeterAiError?.({
+        aiMetricsService.logMeterAiError({
             userId: req.user?.userId, sessionId: aiSessionId, platform,
-            errorCode: error.code || 'AI_UNAVAILABLE', errorMessage: error.message
+            operationId, attemptId, parentAttemptId, eventId: operationId ? `${attemptId}_completed` : null,
+            errorCode: error.code || 'AI_UNAVAILABLE', errorMessage: error.message,
+            meterType, latencyMs: Date.now() - startedAt, providerAttempts: error.providerAttempts
         });
         throw error;
+    } finally {
+        res.removeListener('close', onClose);
     }
-    const value = parseMeterAiResponse(text);
-    // Ghi chỉ số AI công tơ — fire-and-forget
     aiMetricsService.logMeterAiResponse({
-        userId: req.user?.userId,
-        sessionId: aiSessionId,
-        latencyMs: metadata?.durationMs ?? null,
-        aiModel: metadata?.model ?? null,
-        aiReadingValue: value,
-        platform,
-        endToEndLatencyMs: Date.now() - startedAt
+        userId: req.user?.userId, sessionId: aiSessionId,
+        operationId, attemptId, parentAttemptId, eventId: operationId ? `${attemptId}_completed` : null,
+        latencyMs: result.metadata.durationMs, modelLatencyMs: result.metadata.modelLatencyMs,
+        aiModel: result.metadata.model, aiReadingValue: result.value,
+        aiReadingText: result.aiReadingText, status: result.status,
+        rawReadingText: result.rawReadingText, rawReadingValue: result.rawReadingValue,
+        normalizationReasons: result.normalizationReasons, pipelineVersion: result.metadata.pipelineVersion,
+        reasonCode: result.reasonCode,
+        warningCodes: result.warningCodes, providerAttempts: result.metadata.providerAttempts,
+        tokenUsage: result.metadata, platform,
+        endToEndLatencyMs: Date.now() - startedAt, meterType
     });
     return res.status(200).json({
         success: true,
-        data: { value, source: 'GEMINI_AI', aiSessionId, metadata }
+        data: { ...result, readingText: result.aiReadingText, source: 'GEMINI_AI', aiSessionId, operationId, attemptId }
     });
 });
 
@@ -260,6 +279,8 @@ exports.createReading = asyncHandler(async (req, res) => {
     const clientPlatform = ['WEB', 'ANDROID', 'IOS', 'DESKTOP'].includes(String(req.body.platform).toUpperCase())
         ? String(req.body.platform).toUpperCase() : 'UNKNOWN';
     const fallbackChain = String(req.body.fallbackChain || '').slice(0, 120) || null;
+    const aiReadingText = req.body.aiReadingText ? String(req.body.aiReadingText) : null;
+    const userReadingText = req.body.userReadingText ? String(req.body.userReadingText) : null;
 
     const session = await mongoose.startSession();
     let reading;
@@ -386,11 +407,12 @@ exports.createReading = asyncHandler(async (req, res) => {
         await session.commitTransaction();
 
         // Ghi USER_CONFIRMED công tơ — fire-and-forget, sau khi commit an toàn
-        // Chỉ ghi khi nguồn là OCR (có AI trước đó), MANUAL không cần đo AI
-        if (inputSource === 'OCR') {
+        // Nhập tay sau một lượt quét vẫn là kết thúc operation cần đo.
+        // Nhập tay trực tiếp không có operation giữ hành vi cũ.
+        if (inputSource === 'OCR' || (inputSource === 'MANUAL' && req.body.operationId)) {
             // ML Kit chạy local nên không có endpoint recognize để ghi response.
             // Ghi bản OCR đã được người dùng đưa vào bước confirm, không gửi lại ảnh.
-            if (ocrEngine === 'ML_KIT') {
+            if (ocrEngine === 'ML_KIT' && !req.body.operationId) {
                 aiMetricsService.logMeterAiResponse({
                     userId,
                     sessionId: aiSessionId || idempotencyKey,
@@ -398,7 +420,8 @@ exports.createReading = asyncHandler(async (req, res) => {
                     aiReadingValue: ocrValue,
                     platform: clientPlatform,
                     engine: 'ML_KIT',
-                    fallbackChain
+                    fallbackChain,
+                    meterType
                 });
             }
             aiMetricsService.logMeterUserConfirmed({
@@ -410,7 +433,20 @@ exports.createReading = asyncHandler(async (req, res) => {
                 inputSource,
                 platform: clientPlatform,
                 engine: ocrEngine,
-                fallbackChain
+                fallbackChain,
+                meterType,
+                aiReadingText,
+                userReadingText,
+                operationId: req.body.operationId,
+                attemptId: req.body.selectedAttemptId || req.body.attemptId,
+                selectedAttemptId: req.body.selectedAttemptId || req.body.attemptId,
+                pipelineVersion: meterAiService.PIPELINE_VERSION,
+                selectedSuggestionSource: ['OCR', 'HISTORY', 'MANUAL'].includes(req.body.selectedSuggestionSource)
+                    ? req.body.selectedSuggestionSource : undefined,
+                timeToConfirmMs: req.body.timeToConfirmMs,
+                noProposal: req.body.noProposal === true,
+                eventId: req.body.operationId ? `confirmed_${reading._id}_${crypto.createHash('sha256').update(idempotencyKey).digest('hex').slice(0, 16)}` : null,
+                businessRef: { type: 'MeterReading', id: String(reading._id) }
             });
         }
     } catch (error) {

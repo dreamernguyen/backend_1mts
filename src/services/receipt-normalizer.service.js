@@ -56,14 +56,14 @@ const SUBCATEGORY_TO_CATEGORY = Object.freeze({
 });
 
 const UNIT_ALIASES = Object.freeze({
-    g: 'g', gram: 'g', gam: 'g',
+    g: 'g', gr: 'g', gram: 'g', gam: 'g',
     kg: 'kg', kilogram: 'kg',
     ml: 'ml', milliliter: 'ml',
     l: 'L', lit: 'L', litre: 'L', liter: 'L',
     cai: 'Cái', chiec: 'Cái',
     qua: 'Trái/Quả', trai: 'Trái/Quả', 'trai/qua': 'Trái/Quả',
     phan: 'Phần', khay: 'Khay', vi: 'Vỉ', lon: 'Lon',
-    chai: 'Chai', goi: 'Gói', bo: 'Bó', hop: 'Hộp'
+    chai: 'Chai', goi: 'Gói', bo: 'Bó', hop: 'Hộp', tui: 'Túi', loc: 'Lốc', combo: 'Combo', set: 'Combo'
 });
 
 function normalizeWhitespace(value) {
@@ -187,7 +187,7 @@ function inferKnownItemTaxonomy(value) {
 function parseDecimal(value, fallback = 0) {
     if (typeof value === 'number') return Number.isFinite(value) ? value : fallback;
     const raw = normalizeWhitespace(value).replace(/\s/g, '');
-    if (!raw) return fallback;
+    if (!raw || /[~≈<>≥≤]|\d\s*[-–]\s*\d/u.test(raw)) return fallback;
     let normalized = raw.replace(/[^0-9,.-]/g, '');
     if (normalized.includes(',') && normalized.includes('.')) {
         const decimalSeparator = normalized.lastIndexOf(',') > normalized.lastIndexOf('.') ? ',' : '.';
@@ -209,12 +209,17 @@ function parseMoney(value, fallback = 0) {
     return Number.isFinite(parsed) ? Math.round(parsed) : fallback;
 }
 
+function parseUnitPrice(value, fallback = 0) {
+    return typeof value === 'number' && Number.isFinite(value) ? value : parseMoney(value, fallback);
+}
+
 function calculateBaseUnitPrice(item = {}) {
-    const purchasePrice = Math.max(0, parseMoney(item.purchasePrice, 0));
+    const purchasePrice = Math.max(0, parseUnitPrice(item.purchasePrice, 0));
     const quantity = Math.max(0, parseDecimal(item.quantity, 0));
     const standardQuantity = parseDecimal(item.standardQuantity, 0);
-    if (purchasePrice <= 0 || quantity <= 0 || standardQuantity <= 0) return 0;
-    return Math.round((purchasePrice * quantity) / standardQuantity);
+    if (standardQuantity <= 0) return 0;
+    const lineTotal = item.totalPrice == null ? purchasePrice * quantity : Math.max(0,parseMoney(item.totalPrice,0));
+    return lineTotal / standardQuantity;
 }
 
 function normalizeUnit(value) {
@@ -228,15 +233,78 @@ function warning(code, field, message, severity = 'warning') {
     return { code, field, severity, message };
 }
 
+// Inspect each measurement separately. A fruit-size lower bound must not erase
+// the exact package weight elsewhere in the same name; text after | is OCR columns.
+function measureMentions(value) {
+    const text = normalizeWhitespace(value).split('|')[0].trim();
+    const mentions = [];
+    const pattern = /(\d+(?:[.,]\d+)?)\s*(kg|gr|g|ml|l)(?!\p{L})/giu;
+    for (const match of text.matchAll(pattern)) {
+        const prefix = foldVietnamese(text.slice(Math.max(0,match.index-35),match.index));
+        const suffix = foldVietnamese(text.slice(match.index+match[0].length,match.index+match[0].length+30));
+        const boundPrefix = /(?:^|[\s(])(?:~|≈|>=|<=|>|<|≥|≤|tu|hon|tren|duoi|khoang|toi thieu|it nhat)\s*$/u.test(prefix)
+            && !/(?:^|\s)goc\s+tu\s*$/u.test(prefix);
+        const rangePrefix = /\d+(?:[.,]\d+)?\s*(?:kg|gr?|ml|l)?\s*(?:-|–|den|\/)\s*$/u.test(prefix);
+        const rangeSuffix = /^\s*(?:-|–|den|\/)\s*\d+(?:[.,]\d+)?\s*(?:kg|gr?|ml|l)/u.test(suffix);
+        const boundSuffix = /^\s*(?:\+|tro len|tro xuong)/u.test(suffix);
+        const measure = toBaseMeasure({quantity:parseDecimal(match[1],0),unit:match[2].toUpperCase()==='GR'?'G':match[2].toUpperCase()});
+        mentions.push({...measure,ambiguous:boundPrefix||rangePrefix||rangeSuffix||boundSuffix,evidence:match[0]});
+    }
+    return mentions;
+}
+
+function isAmbiguousMeasureName(value) {
+    const mentions = measureMentions(value);
+    return mentions.some(entry=>entry.ambiguous) && !mentions.some(entry=>!entry.ambiguous);
+}
+
+function readExactPackCount(rawName) {
+    const text = foldVietnamese(rawName);
+    const plus = text.match(/(\d+)\s*\+\s*(\d+)\s*(?:qua|trai|cai|vien)(?![a-z])/u);
+    if (plus) return Number(plus[1]) + Number(plus[2]);
+    const eggPlus = /\btrung\s+(?:ga|vit|cut|ngong)\b/u.test(text) && text.match(/(\d+)\s*\+\s*(\d+)(?!\d)(?!\s*(?:kg|gr?|ml|l)\b)/u);
+    if(eggPlus) return Number(eggPlus[1]) + Number(eggPlus[2]);
+    const count = text.match(/(?:hop|vi|khay|goi|tui)\s*(\d+)\s*(?:qua|trai|cai|vien)(?![a-z])/u)
+        || text.match(/(\d+)\s*(?:qua|trai|vien)(?![a-z])/u);
+    return count ? Number(count[1]) : null;
+}
+
+function readExactComboMultiplier(rawName) {
+    const text = foldVietnamese(rawName);
+    const match = text.match(/(?:combo|bo|loc)\s*(\d+)\s*(?:chai|hop|goi|lon|tui)(?![a-z])/u)
+        || text.match(/(\d+)\s*[x×]\s*\d+(?:[.,]\d+)?\s*(?:kg|gr?|ml|l)(?![a-z])/u);
+    return match ? Number(match[1]) : 1;
+}
+
 function readMeasureFromName(rawName) {
-    // \b coi ký tự tiếng Việt có dấu là non-word, nên "1 GÓI" từng bị
-    // nhận nhầm thành 1 gram. Chỉ chấp nhận khi sau token đơn vị không còn
-    // là một chữ cái Unicode.
-    const match = normalizeWhitespace(rawName).match(
-        /(\d+(?:[.,]\d+)?)\s*(kg|g|ml|l)(?!\p{L})/iu
-    );
-    if (!match) return null;
-    return { quantity: parseDecimal(match[1], 0), unit: match[2].toUpperCase() };
+    const exact = measureMentions(rawName).filter(entry=>!entry.ambiguous&&entry.quantity>0);
+    if (!exact.length) return null;
+    const first=exact[0];
+    if(exact.some(entry=>entry.unit!==first.unit || !nearlyEqual(entry.quantity,first.quantity,0.000001))) return null;
+    return {quantity:first.quantity,unit:first.unit};
+}
+
+function validateMeasurementBasis(item) {
+    const input=item.measurementBasis;
+    if(!input || typeof input!=='object' || !['PER_PURCHASE_UNIT','TOTAL'].includes(input.scope)) return null;
+    const quantity=parseDecimal(input.quantity,0);
+    const rawUnit=normalizeWhitespace(input.unit).toUpperCase();
+    const evidence=normalizeWhitespace(input.evidence).slice(0,200);
+    if(quantity<=0 || !['G','GR','KG','ML','L','PIECE'].includes(rawUnit) || !evidence) return null;
+    const productName=normalizeWhitespace(item.rawName||item.itemName).split('|')[0];
+    if(!foldVietnamese(productName).includes(foldVietnamese(evidence))) return null;
+    const proposed=toBaseMeasure({quantity,unit:rawUnit==='GR'?'G':rawUnit});
+    if(proposed.unit==='PIECE') {
+        const count=readExactPackCount(evidence);
+        if(count!==proposed.quantity) return null;
+    } else {
+        const detected=readMeasureFromName(evidence);
+        const exactInName=measureMentions(productName).some(entry=>!entry.ambiguous&&entry.unit===proposed.unit&&nearlyEqual(entry.quantity,proposed.quantity,0.000001));
+        if(!exactInName || !detected || detected.unit!==proposed.unit || !nearlyEqual(detected.quantity,proposed.quantity,0.000001)) return null;
+    }
+    // TOTAL is only credible when the quote explicitly says this is the line total.
+    if(input.scope==='TOTAL' && !/(?:tong|total)\s*(?:khoi luong|dinh luong|net|weight|volume)/u.test(foldVietnamese(evidence))) return null;
+    return {scope:input.scope,quantity:proposed.quantity,unit:proposed.unit,evidence};
 }
 
 function toBaseMeasure(measure) {
@@ -261,6 +329,31 @@ function normalizeMeasure(item, warnings, { requireConfirmation = false } = {}) 
     let standardQuantity = parseDecimal(item.standardQuantity, 0);
     let standardUnit = normalizeWhitespace(item.standardUnit).toUpperCase();
     let measurementStatus = normalizeWhitespace(item.measurementStatus).toUpperCase();
+    const uncertainName = isAmbiguousMeasureName(item.rawName || item.itemName);
+    const measurementBasis = validateMeasurementBasis(item);
+    const exactMentions = measureMentions(item.rawName || item.itemName).filter(entry => !entry.ambiguous);
+    const conflictingMentions = exactMentions.length > 1 && exactMentions.some(entry =>
+        entry.unit !== exactMentions[0].unit || !nearlyEqual(entry.quantity, exactMentions[0].quantity, 0.000001));
+    if (conflictingMentions && !measurementBasis && !readMeasureFromPurchaseUnit(item) && item.measurementConfirmed !== true) {
+        measurementStatus = 'REVIEW_REQUIRED';
+        warnings.push(warning('AMBIGUOUS_PACKAGE_MEASURE', 'standardQuantity', 'Có nhiều định lượng khác nhau; kiểm tra tổng lượng trước khi sử dụng.'));
+    }
+    if (uncertainName && item.measurementConfirmed !== true) {
+        standardQuantity = 0;
+        standardUnit = '';
+        const sourceName = normalizeWhitespace(item.rawName || item.itemName).split('|')[0];
+        const range = sourceName.match(/(\d+(?:[.,]\d+)?)\s*(?:kg|gr?|ml|l)?\s*[-–]\s*(\d+(?:[.,]\d+)?)\s*(kg|gr|g|ml|l)(?!\p{L})/iu);
+        const mention = measureMentions(sourceName).find(entry => entry.ambiguous);
+        const estimate = range
+            ? toBaseMeasure({ quantity: Math.min(parseDecimal(range[1], 0), parseDecimal(range[2], 0)), unit: range[3].toUpperCase() === 'GR' ? 'G' : range[3].toUpperCase() })
+            : mention;
+        if (estimate && estimate.quantity > 0 && !readExactPackCount(sourceName)) {
+            standardQuantity = estimate.quantity * Math.max(1, parseDecimal(item.quantity, 1));
+            standardUnit = estimate.unit;
+        }
+        measurementStatus = 'REVIEW_REQUIRED';
+        warnings.push(warning('AMBIGUOUS_MEASURE_RANGE', 'standardQuantity', 'Định lượng tham khảo từ bao bì; khoảng lấy mức thấp, nếu không sửa sẽ lưu lượng này.'));
+    }
     if (standardUnit === 'GRAM' || standardUnit === 'GR') standardUnit = 'G';
     if (standardUnit === 'LITRE' || standardUnit === 'LITER') standardUnit = 'L';
 
@@ -277,6 +370,13 @@ function normalizeMeasure(item, warnings, { requireConfirmation = false } = {}) 
         }
     }
 
+    if(measurementBasis && item.measurementConfirmed !== true) {
+        const multiplier=measurementBasis.scope==='TOTAL'?1:Math.max(0,parseDecimal(item.quantity,1));
+        standardQuantity=measurementBasis.quantity*multiplier;
+        standardUnit=measurementBasis.unit;
+        measurementStatus='CONFIRMED';
+        warnings.push(warning('MEASURE_DERIVED_FROM_EVIDENCE','standardQuantity','Định lượng được tính từ bằng chứng xác định và số lượng mua; không dùng giới hạn kích cỡ làm khối lượng.','info'));
+    }
     if (standardUnit === 'KG') {
         standardQuantity *= 1000;
         standardUnit = 'G';
@@ -289,6 +389,10 @@ function normalizeMeasure(item, warnings, { requireConfirmation = false } = {}) 
     // 0.350). Cặp quantity + unit là bằng chứng xác định, nên dùng nó để sửa
     // trường hợp AI giữ 0.350 nhưng gắn nhầm standardUnit=G thành 0.350 gram.
     const purchaseMeasure = readMeasureFromPurchaseUnit(item);
+    if(purchaseMeasure) {
+        measurementStatus = 'CONFIRMED';
+        for(let index=warnings.length-1;index>=0;index--) if(warnings[index].code === 'AMBIGUOUS_MEASURE_RANGE') warnings.splice(index,1);
+    }
     if (purchaseMeasure && (
         standardQuantity <= 0
         || standardUnit !== purchaseMeasure.unit
@@ -304,7 +408,7 @@ function normalizeMeasure(item, warnings, { requireConfirmation = false } = {}) 
     }
 
     if (standardQuantity <= 0 || !['G', 'ML', 'PIECE'].includes(standardUnit)) {
-        standardQuantity = 1;
+        standardQuantity = Math.max(1, parseDecimal(item.quantity, 1));
         standardUnit = 'PIECE';
         if (requireConfirmation) measurementStatus = 'REVIEW_REQUIRED';
         warnings.push(warning(
@@ -333,19 +437,33 @@ function normalizeMeasure(item, warnings, { requireConfirmation = false } = {}) 
         'khay', 'tui', 'hop', 'goi', 'vi', 'lon', 'chai', 'can', 'hu', 'lo', 'tuyp', 'bo'
     ]);
     const detectedPerPackage = toBaseMeasure(readMeasureFromName(item.rawName || item.itemName));
-    if (quantity > 1
-        && packagedUnits.has(purchaseUnit)
-        && detectedPerPackage
-        && detectedPerPackage.unit === standardUnit
-        && nearlyEqual(standardQuantity, detectedPerPackage.quantity)) {
-        standardQuantity *= quantity;
-        warnings.push(warning(
-            'PACKAGED_MEASURE_TOTALIZED',
-            'standardQuantity',
-            'Định lượng mỗi bao bì đã được nhân với số lượng mua để lưu tổng lượng khả dụng.'
-        ));
+    if (packagedUnits.has(purchaseUnit) && detectedPerPackage && detectedPerPackage.unit === standardUnit && item.measurementConfirmed !== true && measurementBasis?.scope !== 'TOTAL') {
+        const expectedTotal = detectedPerPackage.quantity * quantity;
+        if(!nearlyEqual(standardQuantity, expectedTotal,0.000001)) {
+            const wasPerPackage=nearlyEqual(standardQuantity,detectedPerPackage.quantity,0.000001);
+            standardQuantity=expectedTotal;
+            warnings.push(warning(wasPerPackage?'PACKAGED_MEASURE_TOTALIZED':'PACKAGED_MEASURE_RECONCILED','standardQuantity','Tổng định lượng được tính từ định lượng bao bì xác định và số lượng mua.','info'));
+        }
     }
-    return { standardQuantity, standardUnit, measurementStatus };
+    const countUnit = ['cai', 'trai/qua', 'qua', 'trai'].includes(purchaseUnit);
+    const exactPackCount = readExactPackCount(item.rawName || item.itemName);
+    const pieceQuantity = countUnit ? quantity : (exactPackCount && ['hop','vi','khay','goi','tui','combo','bo','loc'].includes(purchaseUnit) ? exactPackCount * quantity : null);
+    if (pieceQuantity && ['PIECE',''].includes(standardUnit) && item.measurementConfirmed !== true) {
+        standardQuantity = pieceQuantity;
+        standardUnit = 'PIECE';
+        measurementStatus = 'CONFIRMED';
+        warnings.push(warning('PIECE_COUNT_DERIVED', 'standardQuantity', 'Số lượng đơn vị được xác định từ số lượng mua hoặc số lượng mỗi bao bì.'));
+    }
+    const comboMultiplier = readExactComboMultiplier(item.rawName || item.itemName);
+    if (comboMultiplier > 1 && ['combo','bo','loc'].includes(purchaseUnit) && detectedPerPackage && detectedPerPackage.unit === standardUnit && item.measurementConfirmed !== true) {
+        standardQuantity = detectedPerPackage.quantity * comboMultiplier * quantity;
+        measurementStatus = 'CONFIRMED';
+        warnings.push(warning('COMBO_MEASURE_TOTALIZED', 'standardQuantity', 'Định lượng được nhân theo số bao bì ghi rõ trong combo và số combo mua.'));
+    }
+    if (measurementStatus === 'CONFIRMED' && (pieceQuantity || comboMultiplier > 1 && ['combo','bo','loc'].includes(purchaseUnit))) {
+        for(let index=warnings.length-1;index>=0;index--) if(['AMBIGUOUS_UNIT','MEASUREMENT_CONFIRMATION_REQUIRED'].includes(warnings[index].code)) warnings.splice(index,1);
+    }
+    return { standardQuantity, standardUnit, measurementStatus, ...(measurementBasis ? {measurementBasis} : {}) };
 }
 
 function isValidCategorySubCategory(categoryValue, subCategoryValue) {
@@ -442,51 +560,19 @@ function nearlyEqual(left, right, toleranceRatio = 0.02) {
     return Math.abs(left - right) <= Math.max(0.01, right * toleranceRatio);
 }
 
-function reconcileWeightedLine({ input, quantity, unit, measure, purchasePrice, warnings, context }) {
+function reconcileWeightedLine({ input, quantity, unit, measure, purchasePrice, warnings }) {
     const rawLineTotal = input.totalPrice ?? input.lineTotal;
-    const hasLineTotal = rawLineTotal !== undefined && rawLineTotal !== null
-        && normalizeWhitespace(rawLineTotal) !== '';
+    const hasLineTotal = rawLineTotal !== undefined && rawLineTotal !== null && normalizeWhitespace(rawLineTotal) !== '';
     const lineTotal = hasLineTotal ? Math.max(0, parseMoney(rawLineTotal, 0)) : 0;
-    const foldedUnit = foldVietnamese(unit);
-    const isMassOrVolumeMeasure = ['G', 'ML'].includes(measure.standardUnit);
-    const isMeasuredPurchaseUnit = ['g', 'kg', 'ml', 'l'].includes(foldedUnit);
-    const isFractionalMeasuredPurchase = isMeasuredPurchaseUnit
-        && quantity > 0 && quantity < 1;
-    const duplicatesMeasure = nearlyEqual(quantity, measure.standardQuantity);
-    const looksLikeWeightedLine = isMassOrVolumeMeasure && (
-        quantity > 20 || quantity > 0 && quantity < 1
-        || isMeasuredPurchaseUnit && duplicatesMeasure
-    );
-
-    if (!looksLikeWeightedLine) {
-        return { quantity, unit, purchasePrice, lineTotal, hasLineTotal };
+    const measuredUnit = ['g','kg','ml','l'].includes(foldVietnamese(unit));
+    if (!measuredUnit || !['G','ML'].includes(measure.standardUnit)) return {quantity,unit,purchasePrice,lineTotal,hasLineTotal};
+    const nativeTotal = Math.round(quantity * purchasePrice);
+    const total = hasLineTotal ? lineTotal : nativeTotal;
+    warnings.push(warning('WEIGHTED_LINE_NORMALIZED','quantity','Hàng cân đã được quy đổi về một phần mua; thành tiền được giữ hoặc tính từ số lượng và đơn giá gốc.'));
+    if(hasLineTotal && Math.abs(nativeTotal-lineTotal) > Math.max(1,lineTotal*0.02)) {
+        warnings.push(warning('WEIGHTED_PRICE_BASIS_REVIEW','purchasePrice','Thành tiền không khớp đơn giá theo đơn vị cân; giữ thành tiền đọc được và cần kiểm tra đơn giá gốc.'));
     }
-
-    const computedTotal = Math.round(quantity * purchasePrice);
-    const transactionAmount = Math.max(0, parseMoney(context?.transactionAmount, 0));
-    const impossibleAgainstReceipt = transactionAmount > 0
-        && computedTotal > Math.max(transactionAmount * 3, transactionAmount + 100000);
-    const lineTotalSupportsCorrection = lineTotal > 0
-        && Math.abs(computedTotal - lineTotal) > Math.max(1000, lineTotal * 0.02);
-
-    if (!duplicatesMeasure && !isFractionalMeasuredPurchase
-        && !impossibleAgainstReceipt && !lineTotalSupportsCorrection) {
-        return { quantity, unit, purchasePrice, lineTotal, hasLineTotal };
-    }
-
-    warnings.push(warning(
-        'WEIGHTED_LINE_NORMALIZED',
-        'quantity',
-        'Hệ thống nhận diện đây là định lượng của một phần hàng cân và đã tách khỏi số lượng mua.'
-    ));
-
-    return {
-        quantity: 1,
-        unit: 'Phần',
-        purchasePrice: lineTotal > 0 ? lineTotal : purchasePrice,
-        lineTotal: lineTotal > 0 ? lineTotal : purchasePrice,
-        hasLineTotal
-    };
+    return {quantity:1,unit:'Phần',purchasePrice:total,lineTotal:total,hasLineTotal:true};
 }
 
 function normalizeReceiptItem(input = {}, context = {}) {
@@ -507,6 +593,10 @@ function normalizeReceiptItem(input = {}, context = {}) {
             'category',
             'Danh mục được sửa lại từ cụm tên nguyên liệu đã nhận diện chắc chắn.'
         ));
+    }
+    if(/(?:^|\s)(?:bap(?!\s+cai)(?:\s+my)?|ngo)(?:\s|$)/u.test(searchableName)) {
+        category='VEGETABLE';
+        subCategory='OTHER_VEG';
     }
     const expectedCategory = SUBCATEGORY_TO_CATEGORY[subCategory];
     if (expectedCategory && category !== expectedCategory && subCategory !== 'OTHER') {
@@ -543,7 +633,9 @@ function normalizeReceiptItem(input = {}, context = {}) {
         warnings.push(warning('MISSING_ITEM_NAME', 'itemName', 'Không xác định được tên mặt hàng.', 'error'));
     }
 
+    const hasQuantity = input.quantity !== undefined && input.quantity !== null && normalizeWhitespace(input.quantity) !== '';
     let quantity = parseDecimal(input.quantity, 1);
+    if(!hasQuantity) warnings.push(warning('MISSING_QUANTITY','quantity','Không đọc được số lượng mua; tạm đặt là 1 và cần kiểm tra.'));
     if (quantity <= 0) {
         quantity = 1;
         warnings.push(warning('INVALID_QUANTITY', 'quantity', 'Số lượng không hợp lệ; tạm đặt là 1.', 'error'));
@@ -557,7 +649,16 @@ function normalizeReceiptItem(input = {}, context = {}) {
         requireConfirmation: COOKABLE_ITEM_CATEGORIES.has(category)
     });
 
-    let purchasePrice = Math.max(0, parseMoney(input.purchasePrice, 0));
+    let purchasePrice = Math.max(0, parseUnitPrice(input.purchasePrice, 0));
+    const suppliedLineTotal = input.totalPrice ?? input.lineTotal;
+    const missingUnitPrice = input.purchasePrice === undefined || input.purchasePrice === null || normalizeWhitespace(input.purchasePrice) === '';
+    const hasLineDiscount = parseMoney(input.lineDiscount ?? input.discount,0) > 0;
+    if(missingUnitPrice && hasQuantity && quantity > 0 && suppliedLineTotal != null && !hasLineDiscount) {
+        purchasePrice = Math.max(0,parseMoney(suppliedLineTotal,0))/quantity;
+        warnings.push(warning('UNIT_PRICE_DERIVED_FROM_TOTAL','purchasePrice','Đơn giá được tính từ thành tiền và số lượng mua đã đọc được.'));
+    } else if(missingUnitPrice) {
+        warnings.push(warning('MISSING_UNIT_PRICE','purchasePrice','Không đọc được đơn giá và chưa đủ bằng chứng để tính lại.'));
+    }
     const reconciled = reconcileWeightedLine({
         input, quantity, unit, measure, purchasePrice, warnings, context
     });
@@ -590,7 +691,15 @@ function normalizeReceiptItem(input = {}, context = {}) {
     const storageLocation = resolveStorageLocation(input, category, subCategory);
     const expiry = resolveExpiry(input, context, category, subCategory, storageLocation);
 
+    const inventoryEligible = !/^(?:qua tang\s*:?\s*)?(?:voucher|phieu mua hang|phieu qua tang|gift card)(?:\s|$)/u.test(foldVietnamese(rawName));
+    if(!inventoryEligible) warnings.push(warning('NON_INVENTORY_VOUCHER','rawName','Phiếu mua hàng/voucher được giữ trong tổng hóa đơn nhưng không nhập kho.'));
+    const requiresDeliveryConfirmation = inventoryEligible && /(?:^|\s)(?:qua tang|hang tang|tang kem)(?:\s|$)/u.test(foldVietnamese(rawName));
+    if(requiresDeliveryConfirmation && input.deliveryConfirmed !== true) warnings.push(warning('GIFT_DELIVERY_CONFIRMATION_REQUIRED','quantity','Mặt hàng quà tặng cần xác nhận đã nhận thực tế trước khi nhập kho.'));
     return {
+        ...(normalizeWhitespace(input.sourceLineId) ? {sourceLineId:normalizeWhitespace(input.sourceLineId)} : {}),
+        requiresDeliveryConfirmation,
+        deliveryConfirmed: input.deliveryConfirmed === true,
+        inventoryEligible,
         rawName,
         itemName,
         brand: normalizeWhitespace(input.brand) || 'No name',
@@ -601,6 +710,7 @@ function normalizeReceiptItem(input = {}, context = {}) {
         unit,
         standardQuantity: measure.standardQuantity,
         standardUnit: measure.standardUnit,
+        ...(measure.measurementBasis ? {measurementBasis:measure.measurementBasis} : {}),
         // Chế độ trừ kho được suy ra từ đơn vị chuẩn, không phụ thuộc AI hay
         // một công tắc người dùng có thể đặt lệch với định lượng.
         isSingleUse: measure.standardUnit === 'PIECE',
@@ -636,6 +746,7 @@ function normalizeTransactionDraft(input = {}) {
         ? parsedDate.toISOString().slice(0, 10)
         : null;
     if (input.date && !date) warnings.push(warning('INVALID_DATE', 'date', 'Ngày trên hóa đơn không hợp lệ.'));
+    if(!date) warnings.push(warning('MISSING_RECEIPT_DATE','date','Chưa có ngày mua đầy đủ; cần kiểm tra hoặc chọn ngày trước khi xác nhận.'));
 
     const amount = Math.max(0, parseMoney(input.amount, 0));
     const rawItems = Array.isArray(input.items) ? input.items : [];

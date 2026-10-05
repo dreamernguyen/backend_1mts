@@ -16,6 +16,7 @@ const userRoutes = require('./src/routes/user.route');
 const notificationRoutes = require('./src/routes/notification.route');
 const questRoutes = require('./src/routes/quest.route');
 const meterRoutes = require('./src/routes/meter.route');
+const aiMetricsRoutes = require('./src/routes/aiMetrics.route');
 
 // Firebase xác thực; cron nhắc lô sắp hết hạn.
 const { admin, initializeFirebase } = require('./src/config/firebase.config');
@@ -62,6 +63,7 @@ app.use('/api/user', userRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/api/quests', questRoutes);
 app.use('/api', meterRoutes);
+app.use('/api', aiMetricsRoutes);
 
 // Chỉ báo sẵn sàng khi cả MongoDB và Firebase đã khởi tạo.
 app.get('/health', (req, res) => {

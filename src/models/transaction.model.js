@@ -43,6 +43,8 @@ const embeddedItemSchema = new Schema({
     required: [true, 'Đơn giá mặt hàng là bắt buộc!'], 
     min: [0, 'Giá tiền không được nhỏ hơn 0!'] 
   },
+  // Thành tiền thực tế của dòng; optional để đọc lịch sử cũ không cần migration.
+  totalPrice: { type: Number, min: 0 },
   
   category: {
     type: String,
@@ -167,6 +169,9 @@ const transactionSchema = new Schema(
     gamificationRewards: {
       savedAmount: { type: Number, default: 0, min: 0 },
       wisBonus: { type: Number, default: 0, min: 0 },
+      priceComparisons: [{ _id: false, itemName: String, standardUnit: String,
+        previousPrice: Number, currentPrice: Number, purchasedMeasure: Number,
+        savedAmount: Number, referenceTransactionId: String, referenceDate: Date }],
       message: { type: String, default: '' }
     },
     

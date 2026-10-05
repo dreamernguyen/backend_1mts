@@ -36,6 +36,8 @@ const executeWithFallback = async ({
     contextName = 'AI Service'
 }) => {
     let lastError = null;
+    let providerAttemptCount = 0;
+    const operationStartedAt = Date.now();
     let currentDelay = delayMs;
     
     for (let r = 0; r <= retries; r++) {
@@ -43,6 +45,7 @@ const executeWithFallback = async ({
         for (const modelName of FALLBACK_MODELS) {
             try {
                 const model = genAI.getGenerativeModel({ model: modelName, systemInstruction });
+                providerAttemptCount++;
                 const request = model.generateContent({
                     contents: [{ role: 'user', parts: promptParts }],
                     ...(generationConfig && { generationConfig })
@@ -74,7 +77,7 @@ const executeWithFallback = async ({
                 return {
                     text: response.text(),
                     metadata: {
-                        requestId, 
+                        requestId, providerAttemptCount, totalDurationMs: Date.now() - operationStartedAt,
                         model: modelName,
                         durationMs: Date.now() - startedAt,
                         finishReason,
@@ -94,8 +97,60 @@ const executeWithFallback = async ({
             currentDelay *= 2;
         }
     }
+    if (lastError) lastError.metadata = { providerAttemptCount, totalDurationMs: Date.now() - operationStartedAt };
     throw lastError || wrapGeminiApiError(new Error(`[${contextName}] Thất bại sau khi thử tất cả model.`));
 };
+
+// Receipt-only deadline: recipe/insight orchestration remains unchanged.
+async function executeReceiptWithDeadline({systemInstruction,promptParts,requestId='unknown',totalDeadlineMs=120000,signal}, client=genAI, models=FALLBACK_MODELS) {
+    const deadlineMs=Math.max(1,Math.min(120000,Number(totalDeadlineMs)||120000));
+    const startedAt=Date.now();
+    const attempts=[];
+    let lastError;
+    const metadata = () => ({requestId,durationMs:Date.now()-startedAt,totalDeadlineMs:deadlineMs,providerAttemptCount:attempts.length,attempts:attempts.map(entry => ({...entry})),
+        promptTokenCount:attempts.reduce((sum,a)=>sum+(a.tokenUsage?.promptTokenCount||0),0),
+        candidatesTokenCount:attempts.reduce((sum,a)=>sum+(a.tokenUsage?.candidatesTokenCount||0),0),
+        totalTokenCount:attempts.reduce((sum,a)=>sum+(a.tokenUsage?.totalTokenCount||0),0)});
+    for(const modelName of models) {
+        const remaining=deadlineMs-(Date.now()-startedAt);
+        if(remaining <= 0 || signal?.aborted) break;
+        const attemptBudget=Math.min(60000,remaining);
+        const attemptStart=Date.now();
+        const attempt={model:modelName,attemptIndex:attempts.length+1,status:'ERROR',durationMs:0};
+        attempts.push(attempt);
+        const abort=new AbortController();
+        let timer;
+        const cancel=()=>abort.abort();
+        if(signal) signal.addEventListener('abort',cancel,{once:true});
+        try {
+            const model=client.getGenerativeModel({model:modelName,systemInstruction});
+            const request=model.generateContent({contents:[{role:'user',parts:promptParts}],generationConfig:buildReceiptGenerationConfig()}, {signal:abort.signal,timeout:attemptBudget});
+            const result=await Promise.race([request,new Promise((_,reject)=>{
+                timer=setTimeout(()=>{const error=new Error('Hết thời gian chờ AI hóa đơn.');error.code='AI_TIMEOUT';error.statusCode=504;reject(error);abort.abort();},attemptBudget);
+            })]);
+            const response=result.response;
+            const finishReason=response.candidates?.[0]?.finishReason ?? null;
+            attempt.tokenUsage=readUsageMetadata(response);
+            if(finishReason==='MAX_TOKENS') {const error=new Error('AI trả JSON chưa hoàn tất.');error.code='GEMINI_FINISH_MAX_TOKENS';error.statusCode=502;throw error;}
+            const text=response.text();
+            attempt.status='SUCCESS';attempt.durationMs=Date.now()-attemptStart;
+            return {text,response,metadata:{...metadata(),model:modelName,modelDurationMs:attempt.durationMs,finishReason}};
+        } catch(error) {
+            if(!signal?.aborted && /abort|timeout/i.test(error.name || '')) error=Object.assign(new Error('Hết thời gian chờ AI hóa đơn.'),{code:'AI_TIMEOUT',statusCode:504,cause:error});
+            lastError=signal?.aborted ? Object.assign(new Error('Đã hủy đọc hóa đơn.'),{code:'AI_ABORTED',statusCode:499}) : error.statusCode ? error : wrapGeminiApiError(error);
+            attempt.durationMs=Date.now()-attemptStart;attempt.errorCode=lastError.code;
+            console.warn('[Receipt AI attempt]',{requestId,model:modelName,code:lastError.code,durationMs:attempt.durationMs});
+            if(signal?.aborted || [400,401,403].includes(lastError.statusCode)) break;
+        } finally {
+            clearTimeout(timer);
+            if(signal) signal.removeEventListener('abort',cancel);
+        }
+    }
+    if(!lastError) lastError=Object.assign(new Error(signal?.aborted?'Đã hủy đọc hóa đơn.':'Hết ngân sách thời gian đọc hóa đơn.'),{code:signal?.aborted?'AI_ABORTED':'AI_TIMEOUT',statusCode:signal?.aborted?499:504});
+    lastError.metadata=metadata();
+    throw lastError;
+}
+exports.executeReceiptWithDeadline=executeReceiptWithDeadline;
 
 // Cấu hình yêu cầu Gemini trả về JSON thuần túy (không dùng schema cứng để tránh lỗi MAX_TOKENS sớnm)
 const buildReceiptGenerationConfig = () => ({
@@ -127,24 +182,15 @@ exports.buildReceiptGenerationConfig = buildReceiptGenerationConfig;
 
 // Tính năng 1: Gửi ảnh và trích xuất dữ liệu Hóa đơn / Chỉ số công tơ điện nước.
 // Được thiết kế chuyên biệt để gọi OCR, chỉ trả về JSON, không áp dụng logic timeout quá gắt.
-exports.generateStructuredReceipt = async ({
-    systemInstruction,
-    promptParts,
-    requestId = 'unknown',
-    inputMode = 'unknown'
-}) => {
+exports.generateStructuredReceipt = async ({systemInstruction,promptParts,requestId='unknown',inputMode='unknown',totalDeadlineMs,signal}) => {
     try {
-        const result = await executeWithFallback({
-            systemInstruction,
-            promptParts,
-            generationConfig: buildReceiptGenerationConfig(),
-            requestId,
-            contextName: 'Receipt AI'
-        });
-        console.info('[Receipt AI]', { inputMode, ...result.metadata });
-        return { text: result.text, metadata: { inputMode, ...result.metadata } };
-    } catch (error) {
-        console.warn('[Receipt AI error]', { requestId, inputMode, code: error.code, message: error.message });
+        const result = totalDeadlineMs != null
+            ? await executeReceiptWithDeadline({systemInstruction,promptParts,requestId,totalDeadlineMs,signal})
+            : await executeWithFallback({systemInstruction,promptParts,generationConfig:buildReceiptGenerationConfig(),requestId,contextName:'Receipt AI'});
+        console.info('[Receipt AI]',{inputMode,...result.metadata});
+        return {text:result.text,metadata:{inputMode,...result.metadata}};
+    } catch(error) {
+        console.warn('[Receipt AI error]',{requestId,inputMode,code:error.code,message:error.message});
         throw error;
     }
 };
@@ -340,7 +386,7 @@ LƯU Ý QUAN TRỌNG: NẾU BẠN CHỌN TỪ DB (isFromDatabase=true), customRe
 // Tính năng 6: Bếp trưởng AI (Tư vấn Bữa ăn Thông minh - Kiến trúc Hybrid).
 // Kết hợp giữa quy tắc cứng (Rule-based) và AI Semantic.
 // Bắt buộc AI tuân thủ các quy tắc tận dụng đồ ăn thừa và tránh lãng phí thực phẩm.
-exports.consultHeadChefAI = async (report) => {
+exports.consultHeadChefAI = async (report, onMetadata = () => {}) => {
     try {
         const prompt = `
 Bạn là Bếp trưởng sinh tồn chuyên nghiệp. Dưới đây là Báo cáo kho đồ ăn của người dùng:
@@ -389,9 +435,11 @@ ${AI_PORTION_RULES}
             retries: 2,
             contextName: 'Chef AI'
         });
+        onMetadata(result.metadata);
         const responseText = result.text.replace(/```json/g, '').replace(/```/g, '').trim();
         return JSON.parse(responseText);
     } catch (error) {
+        if (error.metadata) onMetadata(error.metadata);
         console.error("Error consulting chef AI:", error);
         throw new Error(formatAiError(error, "Lỗi khi tư vấn món ăn: "));
     }

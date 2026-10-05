@@ -338,6 +338,11 @@ exports.getItemDetail = asyncHandler(async (req, res) => {
                 _id: {
                     // Nếu rawName có giá trị -> gom theo rawName+expiryDate
                     // Nếu rỗng -> gom theo itemName+expiryDate
+                    // Keep distinct purchase prices/units visible as separate detail groups.
+                    purchasePrice: '$purchasePrice',
+                    baseUnitPrice: '$baseUnitPrice',
+                    unit: '$unit',
+                    standardUnit: '$standardUnit',
                     groupKey: {
                         $cond: {
                             if: { $and: [{ $ne: ['$rawName', ''] }, { $ne: ['$rawName', null] }] },

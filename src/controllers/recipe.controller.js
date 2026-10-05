@@ -271,8 +271,7 @@ exports.getRecipeDetails = asyncHandler(async (req, res) => {
 // "Hôm nay ăn gì" dùng cùng recommendation engine; AI chỉ là fallback.
 exports.suggestTodayRecipe = asyncHandler(async (req, res) => {
     const userId = req.user.userId;
-    const sessionId = req.get('X-Request-Id') || `recipe-suggest-${Date.now()}`;
-    const startedAt = Date.now();
+    const sessionId = req.recipeMetrics.sessionId;
     // Một snapshot duy nhất cho ranking, AI context và validation trong request này.
     const inventorySnapshot = await inventoryService.loadUsableInventorySnapshot(userId);
     const rankedRecipes = await rankRecipesForInventory(userId, 400, inventorySnapshot);
@@ -283,6 +282,7 @@ exports.suggestTodayRecipe = asyncHandler(async (req, res) => {
     } = selectTodayRecipe(rankedRecipes, excludedRecipeIds);
 
     if (bestDatabaseMatch) {
+        req.recipeMetrics.candidates = [bestDatabaseMatch.recipe];
         const now = new Date();
         const timeZone = process.env.APP_TIME_ZONE || 'Asia/Ho_Chi_Minh';
         const mealContext = inferUpcomingMeal(
@@ -290,15 +290,6 @@ exports.suggestTodayRecipe = asyncHandler(async (req, res) => {
             bestDatabaseMatch.recipe.cookingTimeMinutes,
             timeZone
         );
-        // Ghi chỉ số gợi ý từ DB (không dùng AI) — fire-and-forget
-        aiMetricsService.logRecipeAiResponse({
-            userId, sessionId,
-            latencyMs: Date.now() - startedAt,
-            usedAiFallback: false,
-            suggestionCount: 1,
-            recipeId: bestDatabaseMatch.recipe.recipeId,
-            recommendationSource: 'RULE_DB'
-        });
         return res.status(200).json({
             success: true,
             data: {
@@ -343,7 +334,8 @@ exports.suggestTodayRecipe = asyncHandler(async (req, res) => {
     }
 
     // AI chỉ là fallback khi catalog không có món qua hard gate.
-    const suggestion = await geminiService.consultHeadChefAI(inventoryReport);
+    req.recipeMetrics.source = 'GEMINI_FALLBACK';
+    const suggestion = await geminiService.consultHeadChefAI(inventoryReport, metadata => { req.recipeMetrics.provider = metadata; });
 
     // Recipe AI phải qua matcher trước khi UI cho phép nấu.
     if (suggestion && suggestion.customRecipe) {
@@ -365,9 +357,11 @@ exports.suggestTodayRecipe = asyncHandler(async (req, res) => {
             });
 
         const aiAnalysis = analyzeRecipe(candidateRecipe, inventorySnapshot);
+        req.recipeMetrics.candidates = [decorateRecipe(candidateRecipe, aiAnalysis)];
         if (aiAnalysis.canCook) {
             if (!existing) await candidateRecipe.save();
             suggestion.recipeId = existing?.recipeId || newRecipeId;
+            req.recipeMetrics.candidates[0].recipeId = suggestion.recipeId;
             suggestion.matchScore = aiAnalysis.matchScore;
             suggestion.feasibleServings = aiAnalysis.feasibleServings;
         } else {
@@ -379,16 +373,6 @@ exports.suggestTodayRecipe = asyncHandler(async (req, res) => {
         
         delete suggestion.customRecipe;
     }
-
-    // Ghi chỉ số gợi ý dùng AI fallback — fire-and-forget
-    aiMetricsService.logRecipeAiResponse({
-        userId, sessionId,
-        latencyMs: Date.now() - startedAt,
-        usedAiFallback: true,
-        suggestionCount: suggestion?.recipeId ? 1 : 0,
-        recipeId: suggestion?.recipeId || null,
-        recommendationSource: 'GEMINI_FALLBACK'
-    });
 
     console.log(`[API] ${req.method} ${req.originalUrl} - Suggest recipe success (User: ${userId})`);
     res.status(200).json({
@@ -496,8 +480,7 @@ Trả về CHỈ JSON, không giải thích thêm.
 // JSON có provenance, sau đó matcher kiểm tra lại đủ lượng/đơn vị/expiry.
 // AI draft được lưu DRAFT để có thể xem/nấu, nhưng không lẫn vào catalog chính.
 exports.ragSuggestRecipe = asyncHandler(async (req, res) => {
-    const recommendationSessionId = /^[A-Za-z0-9_-]{8,150}$/.test(String(req.body?.recommendationSessionId || ''))
-        ? String(req.body.recommendationSessionId) : `recipe-rag-${Date.now()}`;
+    const recommendationSessionId = req.recipeMetrics.sessionId;
     let query;
     try {
         query = recipeRagService.normalizeQuery(req.body?.query);
@@ -547,6 +530,7 @@ exports.ragSuggestRecipe = asyncHandler(async (req, res) => {
 
     let completion;
     try {
+        req.recipeMetrics.source = 'RAG_GEMINI';
         completion = await geminiService.generateStructuredReceipt({
             systemInstruction: 'Bạn trả lời JSON cho RAG công thức. Chỉ bám dữ liệu context và tuân thủ schema được yêu cầu.',
             promptParts: [{
@@ -560,6 +544,7 @@ exports.ragSuggestRecipe = asyncHandler(async (req, res) => {
             inputMode: 'recipe_rag'
         });
     } catch (error) {
+        req.recipeMetrics.provider = error.metadata;
         return res.status(error.statusCode || 502).json({
             success: false,
             code: error.code || 'RAG_MODEL_FAILED',
@@ -567,6 +552,7 @@ exports.ragSuggestRecipe = asyncHandler(async (req, res) => {
         });
     }
 
+    req.recipeMetrics.provider = completion.metadata;
     let envelope;
     try {
         envelope = recipeRagService.validateRagEnvelope(
@@ -619,6 +605,7 @@ exports.ragSuggestRecipe = asyncHandler(async (req, res) => {
         dataVersion: 2
     });
     const analysis = analyzeRecipe(candidateRecipe, inventorySnapshot);
+    req.recipeMetrics.candidates = [decorateRecipe(candidateRecipe, analysis)];
 
     // Matcher là quyết định cuối. Không lưu hoặc trả một món "có thể nấu" nếu
     // còn thiếu core ingredient, không tương thích đơn vị, hoặc cần review.
@@ -639,18 +626,6 @@ exports.ragSuggestRecipe = asyncHandler(async (req, res) => {
     candidateRecipe.recipeId = await allocateAiRecipeId();
     await candidateRecipe.save();
     
-    // Ghi AI Metrics cho RAG
-    aiMetricsService.logRecipeAiResponse({
-        userId: req.user.userId,
-        sessionId: recommendationSessionId,
-        latencyMs: ragMetadata.durationMs,
-        usedAiFallback: true,
-        suggestionCount: 1,
-        aiModel: ragMetadata.model,
-        recipeId: candidateRecipe.recipeId,
-        recommendationSource: 'RAG_GEMINI'
-    });
-
     console.info('[Recipe RAG]', {
         userId: req.user.userId,
         recipeId: candidateRecipe.recipeId,
@@ -871,3 +846,8 @@ exports.cookRecipe = asyncHandler(async (req, res) => {
         gamificationState
     });
 });
+
+const { observeRecipe } = require('../services/recipe-metrics-observer');
+for (const [name, mode] of [['suggestTodayRecipe', 'TODAY'], ['getRecommendations', 'OVERVIEW'], ['ragSuggestRecipe', 'RAG']]) {
+    exports[name] = observeRecipe(exports[name], mode, aiMetricsService);
+}
