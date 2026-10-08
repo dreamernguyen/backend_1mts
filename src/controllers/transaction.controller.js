@@ -80,6 +80,7 @@ exports.parseDocument = asyncHandler(async (req, res) => {
         ? req.body.attemptId : `${requestId}_ai`;
     const cleanRawText = rawText?.trim() || '';
     const inputMode = base64Image ? 'image' : inputSource === 'OCR_TEXT' ? 'ocr_text' : 'manual_text';
+    const recordedAt = new Date();
     const lineCount = cleanRawText ? cleanRawText.split(/\r?\n/).filter(Boolean).length : 0;
     const imageBytes = base64Image
         ? Math.max(0, Math.floor((base64Image.split(',').pop().length * 3) / 4))
@@ -202,7 +203,7 @@ QUY TẮC SỐ 2: NẾU ĐỌC ĐƯỢC, BẮT BUỘC TRẢ VỀ JSON SAU:
         promptParts.push({ text: `Đây là TOÀN BỘ văn bản OCR của một hóa đơn. Hãy đọc từ đầu đến cuối, giữ đủ mọi dòng hàng và cấu trúc hóa dữ liệu:\n${cleanRawText}` });
     } else {
         // Xử lý ghi chú nhanh hoặc giọng nói (STT từ Flutter)
-        promptParts.push({ text: `Phân tích câu ghi chép chi tiêu sau: "${cleanRawText}"` });
+        promptParts.push({ text: `Thời điểm ghi nhận: ${recordedAt.toISOString()} (giờ Việt Nam UTC+7). Nếu câu không nêu ngày/giờ mua, dùng chính xác thời điểm này cho date. Nếu có nêu ngày/giờ, giữ đúng thông tin đó. Phân tích câu ghi chép chi tiêu sau: "${cleanRawText}"` });
     }
 
     let responseText = "";
@@ -328,6 +329,12 @@ QUY TẮC SỐ 2: NẾU ĐỌC ĐƯỢC, BẮT BUỘC TRẢ VỀ JSON SAU:
             ...item, sourceLineId: `${attemptId}:${draftIndex}:${lineIndex}`
         })) : []
     }));
+    if (inputMode === 'manual_text' && type !== 'utility' &&
+        !/(?:hôm qua|hôm kia|ngày mai|tuần trước|tháng trước|ngày\s+\d|\d{1,2}[\/.\-]\d{1,2}|\d{4}-\d{2}-\d{2}|\d{1,2}\s*(?:giờ|h\b)|\d{1,2}:\d{2}|sáng nay|trưa nay|chiều nay|tối qua)/iu.test(cleanRawText)) {
+        for (const draft of rawTransactions) {
+            if (draft?.isReadable !== false) draft.date = recordedAt.toISOString();
+        }
+    }
     let normalizedTransactions = normalizeTransactionList(rawTransactions);
     const rawByNormalized = new Map(normalizedTransactions.map((draft, index) => [draft, rawTransactions[index]]));
 

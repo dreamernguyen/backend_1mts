@@ -741,9 +741,12 @@ function normalizeTransactionDraft(input = {}) {
         category = 'OTHERS';
         warnings.push(warning('UNKNOWN_TRANSACTION_CATEGORY', 'category', 'Chưa xác định được nhóm giao dịch.'));
     }
-    const parsedDate = input.date ? new Date(input.date) : null;
+    const rawDate = input.date ? String(input.date) : '';
+    const hasTime = /T\d{2}:\d{2}/.test(rawDate);
+    const hasZone = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(rawDate);
+    const parsedDate = rawDate ? new Date(hasTime && !hasZone ? `${rawDate}+07:00` : rawDate) : null;
     const date = parsedDate && !Number.isNaN(parsedDate.getTime())
-        ? new Date(parsedDate.getTime() + 7 * 3600000).toISOString().slice(0, 10)
+        ? (hasTime ? parsedDate.toISOString() : new Date(parsedDate.getTime() + 7 * 3600000).toISOString().slice(0, 10))
         : null;
     if (input.date && !date) warnings.push(warning('INVALID_DATE', 'date', 'Ngày trên hóa đơn không hợp lệ.'));
     if(!date) warnings.push(warning('MISSING_RECEIPT_DATE','date','Chưa có ngày mua đầy đủ; cần kiểm tra hoặc chọn ngày trước khi xác nhận.'));
