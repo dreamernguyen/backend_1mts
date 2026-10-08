@@ -743,7 +743,7 @@ function normalizeTransactionDraft(input = {}) {
     }
     const parsedDate = input.date ? new Date(input.date) : null;
     const date = parsedDate && !Number.isNaN(parsedDate.getTime())
-        ? parsedDate.toISOString().slice(0, 10)
+        ? new Date(parsedDate.getTime() + 7 * 3600000).toISOString().slice(0, 10)
         : null;
     if (input.date && !date) warnings.push(warning('INVALID_DATE', 'date', 'Ngày trên hóa đơn không hợp lệ.'));
     if(!date) warnings.push(warning('MISSING_RECEIPT_DATE','date','Chưa có ngày mua đầy đủ; cần kiểm tra hoặc chọn ngày trước khi xác nhận.'));
