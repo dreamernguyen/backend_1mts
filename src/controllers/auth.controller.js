@@ -57,24 +57,7 @@ exports.loginAsGuest = asyncHandler(async (req, res) => {
 
     const firebaseUid = decodedToken.uid;
 
-    let user = await User.findOne({ loginType: 'guest', providerId: firebaseUid });
-    const isNewGuest = !user;
-
-    if (isNewGuest) {
-        user = await User.create({
-            displayName: 'Cư dân 1MTS',
-            loginType: 'guest',
-            providerId: firebaseUid
-        });
-
-        // Gửi thông báo chào mừng
-        await Notification.create({
-            userId: user._id,
-            title: 'Chào mừng thành viên mới! 🎉',
-            message: `Chào mừng cư dân ${user.displayName} đã đến với hành trình sinh tồn - 1MTS`,
-            type: 'SYSTEM'
-        });
-    }
+    const { user, isNewGuest } = await require('../services/guest-demo-data.service').initializeGuest(firebaseUid);
 
     console.log(`[User] Login thành công với chế độ Guest - userId=${user._id}`);
     return res.status(200).json({

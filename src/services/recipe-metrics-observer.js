@@ -17,9 +17,9 @@ function observeRecipe(handler, subFeature, metrics) {
                 : data.recipe ? [data.recipe] : state.candidates;
             const unique = [...new Map(recipes.filter(r => r?.recipeId).map(r => [r.recipeId, r])).values()];
             const returnedRecipeIds = subFeature === 'OVERVIEW' ? unique.map(r => r.recipeId)
-                : [data.recipeId || data.recipe?.recipeId].filter(Boolean);
+                : data.choices ? data.choices.map(r => r.recipeId) : [data.recipeId || data.recipe?.recipeId].filter(Boolean);
             try { metrics.logRecipeAiResponse({
-                userId: req.user.userId, sessionId, subFeature, latencyMs: Date.now() - startedAt,
+                userId: req.user.userId, sessionId, subFeature: subFeature === 'RAG' && req.body?.createNew ? 'CREATE' : subFeature, latencyMs: Date.now() - startedAt,
                 usedAiFallback: state.source !== 'RULE_DB', recommendationSource: state.source,
                 recipeId: data.recipeId || data.recipe?.recipeId || null,
                 suggestionCount: returnedRecipeIds.length, returnedRecipeIds, candidates: unique,

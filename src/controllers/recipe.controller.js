@@ -2,12 +2,24 @@ const rpgService = require('../services/rpg.service');
 const mongoose = require('mongoose');
 const asyncHandler = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 const Recipe = require('../models/recipe.model');
+const cookingPolicy = require('../services/cooking-policy.service');
+const draftStore = require('../services/recipe-preview-store');
+let catalogCache = { expires: 0, recipes: null };
+let catalogLoading;
+const catalogSaveJobs = new Map();
+const rankingCache = require('../services/recipe-ranking-cache').createRankingCache();
+async function loadMatchingCatalog() {
+ if (catalogCache.expires > Date.now()) return catalogCache.recipes;
+ if (!catalogLoading) catalogLoading = Recipe.find(VISIBLE_RECIPE_CLAUSE).select(publicRecipeProjection()).sort({ recipeId: 1 }).lean().then(recipes => { catalogCache = { expires: Date.now() + 60000, recipes }; return recipes; }).finally(() => { catalogLoading = null; });
+ return await catalogLoading;
+}
 const Item = require('../models/item.model');
 const geminiService = require('../services/gemini.service');
 const inventoryService = require('../services/inventory.service');
 const { semanticRecipeSearch } = require('../services/recipe-retrieval.service');
 const {
     VISIBLE_RECIPE_CLAUSE,
+    escapeRegExp,
     buildRecipeFilter,
     publicRecipeProjection,
     toPublicIngredient,
@@ -42,9 +54,11 @@ function parseExcludedRecipeIds(value) {
 function decorateRecipe(recipe, analysis) {
     return {
         ...toPublicRecipe(recipe),
+        source: String(recipe.recipeId).startsWith("ai_recipe_") ? "AI" : "SYSTEM",
         matchPercentage: analysis.matchScore,
         matchScore: analysis.matchScore,
         canCook: analysis.canCook,
+        shoppingShortages: cookingPolicy.shoppingShortages(recipe, analysis),
         ingredientCoveragePercent: analysis.ingredientCoveragePercent,
         recommendationScore: analysis.recommendationScore,
         feasibleServings: analysis.feasibleServings,
@@ -65,25 +79,22 @@ async function loadInventory(userId) {
     return inventoryService.loadUsableInventorySnapshot(userId);
 }
 
-async function rankRecipesForInventory(userId, limit = 400, inventorySnapshot = null) {
-    const [inventory, recipes] = await Promise.all([
-        inventorySnapshot || loadInventory(userId),
-        Recipe.find(VISIBLE_RECIPE_CLAUSE)
-            .select(publicRecipeProjection())
-            .sort({ recipeId: 1 })
-            .limit(limit)
-            .lean()
-    ]);
-    return recipes
+async function loadRankedSnapshot(userId, refresh = false) {
+    const started = Date.now();
+    const [inventory, recipes] = await Promise.all([loadInventory(userId), loadMatchingCatalog()]);
+    const fetched = Date.now();
+    const now = new Date();
+    const result = rankingCache.get(userId, inventory, recipes, () => recipes
         .map(recipe => {
-            const analysis = analyzeRecipe(recipe, inventory);
+            const analysis = analyzeRecipe(recipe, inventory, { now, usableSnapshot: true });
             return { recipe: decorateRecipe(recipe, analysis), analysis };
         })
-        .sort((a, b) =>
-            Number(b.analysis.canCook) - Number(a.analysis.canCook)
+        .sort((a, b) => Number(b.analysis.canCook) - Number(a.analysis.canCook)
             || b.analysis.matchScore - a.analysis.matchScore
-            || b.analysis.rescueScore - a.analysis.rescueScore
-        );
+            || b.analysis.rescueScore - a.analysis.rescueScore), refresh);
+    console.info('[Recipe performance]', { catalogCount: recipes.length, inventoryCount: inventory.length,
+        loadMs: fetched - started, matchingMs: Date.now() - fetched, cacheHit: result.cacheHit });
+    return { inventory, catalog: recipes, ...result };
 }
 
 // Tìm kiếm recipe trong catalog. Vector chỉ lấy candidate khi index đã được bật;
@@ -157,9 +168,13 @@ exports.getRecipeDetails = asyncHandler(async (req, res) => {
 
     // Detail theo ID vẫn cho phép mở AI draft vừa tạo. Catalog/search mới áp
     // VISIBLE_RECIPE_CLAUSE để draft không lẫn vào 349 recipe chính.
-    const recipe = await Recipe.findOne({ recipeId })
+    const persistedRecipe = await Recipe.findOne({ recipeId })
         .select(publicRecipeProjection())
         .lean();
+    const originalRecipe = persistedRecipe || draftStore.findRecipe(userId, recipeId);
+    let recipe = originalRecipe;
+    try { if (originalRecipe) recipe = cookingPolicy.applySubstitutions(originalRecipe, req.method === 'GET' ? JSON.parse(req.query.substitutions || '[]') : (req.body.substitutions || [])); }
+    catch (error) { return res.status(400).json({ success: false, message: error.message }); }
     if (!recipe) {
         return res.status(404).json({ success: false, message: 'Không tìm thấy công thức' });
     }
@@ -167,6 +182,12 @@ exports.getRecipeDetails = asyncHandler(async (req, res) => {
     const fridgeItems = await loadInventory(userId);
     const matchingAnalysis = analyzeRecipe(recipe, fridgeItems);
     const decoratedRecipe = decorateRecipe(recipe, matchingAnalysis);
+    const substitutionOptions = (originalRecipe.ingredients || []).flatMap((ingredient, index) => (ingredient.allowedSubstitutions || []).map(option => {
+      const name = typeof option === 'string' ? option : option.canonicalName;
+      const trial = cookingPolicy.applySubstitutions(originalRecipe, [{ index, name }]);
+      const match = analyzeRecipe(trial, fridgeItems).ingredientMatches[index];
+      return { index, name, forIngredient: ingredient.name || ingredient.itemName, enough: match.quantityRatio >= 1 };
+    })).filter(option => option.enough);
     let selectedServings;
     let consumptionPreview = [];
 
@@ -259,6 +280,7 @@ exports.getRecipeDetails = asyncHandler(async (req, res) => {
         success: true,
         data: {
             recipe: decoratedRecipe,
+            substitutionOptions,
             missingAnalysis,
             matchingAnalysis,
             selectedServings,
@@ -268,128 +290,39 @@ exports.getRecipeDetails = asyncHandler(async (req, res) => {
     });
 });
 
-// "Hôm nay ăn gì" dùng cùng recommendation engine; AI chỉ là fallback.
+// Hôm nay ăn gì chỉ xếp hạng catalog; không gọi Gemini.
 exports.suggestTodayRecipe = asyncHandler(async (req, res) => {
     const userId = req.user.userId;
     const sessionId = req.recipeMetrics.sessionId;
     // Một snapshot duy nhất cho ranking, AI context và validation trong request này.
-    const inventorySnapshot = await inventoryService.loadUsableInventorySnapshot(userId);
-    const rankedRecipes = await rankRecipesForInventory(userId, 400, inventorySnapshot);
+    const { inventory: inventorySnapshot, ranked: rankedRecipes } = await loadRankedSnapshot(userId);
+    const report = inventoryService.generateInventoryReportFromSnapshot(inventorySnapshot);
+    if (report.isEmpty || report.onlySpices) return res.json({ success: true, data: { type: 'NEED_SHOPPING', choices: [], needsShopping: true, reasoning: 'Kho chưa có đủ thực phẩm chính. Hãy bổ sung thực phẩm trước khi chọn món.', recommendationSessionId: sessionId, recommendationSource: 'RULE_DB' } });
     const excludedRecipeIds = parseExcludedRecipeIds(req.query.excludeRecipeIds);
-    const {
-        entry: bestDatabaseMatch,
-        rotationReset
-    } = selectTodayRecipe(rankedRecipes, excludedRecipeIds);
-
-    if (bestDatabaseMatch) {
-        req.recipeMetrics.candidates = [bestDatabaseMatch.recipe];
-        const now = new Date();
-        const timeZone = process.env.APP_TIME_ZONE || 'Asia/Ho_Chi_Minh';
-        const mealContext = inferUpcomingMeal(
-            now,
-            bestDatabaseMatch.recipe.cookingTimeMinutes,
-            timeZone
-        );
-        return res.status(200).json({
-            success: true,
-            data: {
-                type: 'DATABASE_RECIPE',
-                reasoning: buildTodaySuggestionReasoning(
-                    bestDatabaseMatch.recipe,
-                    bestDatabaseMatch.analysis,
-                    { now, timeZone }
-                ),
-                recipeId: bestDatabaseMatch.recipe.recipeId,
-                title: bestDatabaseMatch.recipe.title,
-                matchScore: bestDatabaseMatch.analysis.matchScore,
-                feasibleServings: bestDatabaseMatch.analysis.feasibleServings,
-                suggestedMeal: mealContext.code,
-                recommendationSessionId: sessionId,
-                recommendationSource: 'RULE_DB',
-                recommendationRank: 1,
-                rotationReset
-            }
-        });
-    }
-
-    // Báo cáo chỉ chứa lô đã qua hard gate quantity và expiry.
-    const inventoryReport = inventoryService.generateInventoryReportFromSnapshot(inventorySnapshot);
-
-    // Không gọi AI khi kho trống; trả gợi ý đi chợ có thể dự đoán được.
-    if (inventoryReport.isEmpty || inventoryReport.onlySpices) {
-        const randomRecipes = await Recipe.aggregate([
-            { $match: VISIBLE_RECIPE_CLAUSE },
-            { $sample: { size: 5 } },
-            { $project: publicRecipeProjection() }
-        ]);
-        return res.status(200).json({
-            success: true,
-            data: {
-                type: 'NEED_SHOPPING',
-                reasoning: 'Kho hiện không còn nguyên liệu an toàn có thể dùng để nấu, hoặc chỉ còn gia vị. Dưới đây là vài gợi ý đi chợ.',
-                recipeId: null,
-                suggestedRecipesToBuy: randomRecipes
-            }
-        });
-    }
-
-    // AI chỉ là fallback khi catalog không có món qua hard gate.
-    req.recipeMetrics.source = 'GEMINI_FALLBACK';
-    const suggestion = await geminiService.consultHeadChefAI(inventoryReport, metadata => { req.recipeMetrics.provider = metadata; });
-
-    // Recipe AI phải qua matcher trước khi UI cho phép nấu.
-    if (suggestion && suggestion.customRecipe) {
-        const custom = suggestion.customRecipe;
-        const normalizedCustom = normalizeGeneratedRecipe(custom, {
-            description: 'Công thức được sinh ra từ Bếp trưởng AI để dọn tủ lạnh.',
-            imageUrl: 'https://play-lh.googleusercontent.com/ALsQlQMDMZyDCo30-lKP4hPR6VuDz0j3LpwTXYWMpkp556MrGCVpN8sru2oM4RPIgCA',
-            baseServings: 1
-        });
-        const existing = await Recipe.findOne({
-            $and: [VISIBLE_RECIPE_CLAUSE, { title: normalizedCustom.title }]
-        }).select(publicRecipeProjection()).lean();
-        const newRecipeId = await allocateAiRecipeId();
-        const candidateRecipe = existing || new Recipe({
-                recipeId: newRecipeId,
-                ...normalizedCustom,
-                source: 'AI',
-                dataVersion: 2
-            });
-
-        const aiAnalysis = analyzeRecipe(candidateRecipe, inventorySnapshot);
-        req.recipeMetrics.candidates = [decorateRecipe(candidateRecipe, aiAnalysis)];
-        if (aiAnalysis.canCook) {
-            if (!existing) await candidateRecipe.save();
-            suggestion.recipeId = existing?.recipeId || newRecipeId;
-            req.recipeMetrics.candidates[0].recipeId = suggestion.recipeId;
-            suggestion.matchScore = aiAnalysis.matchScore;
-            suggestion.feasibleServings = aiAnalysis.feasibleServings;
-        } else {
-            suggestion.recipeId = null;
-            suggestion.type = 'NEED_SHOPPING';
-            suggestion.missingCoreIngredients = aiAnalysis.missingCoreIngredients;
-            suggestion.reasoning = 'Không có công thức an toàn có thể nấu từ kho hiện tại. Hãy bổ sung nguyên liệu chính hoặc loại bỏ thực phẩm đã hết hạn.';
-        }
-        
-        delete suggestion.customRecipe;
-    }
-
-    console.log(`[API] ${req.method} ${req.originalUrl} - Suggest recipe success (User: ${userId})`);
-    res.status(200).json({
-        success: true,
-        data: suggestion?.recipeId ? {
-            ...suggestion,
-            recommendationSessionId: sessionId,
-            recommendationSource: 'GEMINI_FALLBACK',
-            recommendationRank: 1
-        } : suggestion
+    let pool = rankedRecipes.filter(entry => !excludedRecipeIds.includes(entry.recipe.recipeId));
+    const rotationReset = pool.length === 0;
+    if (rotationReset) pool = rankedRecipes;
+    const shuffle = entries => entries.map(entry => ({ entry, random: Math.random() })).sort((a,b) => b.entry.analysis.rescueScore - a.entry.analysis.rescueScore || a.random - b.random).map(e => e.entry);
+    const cookable = shuffle(pool.filter(e => e.analysis.canCook));
+    const shopping = pool.filter(e => !e.analysis.canCook && e.analysis.matchScore > 0).sort((a,b) => a.analysis.missingCoreIngredients.length - b.analysis.missingCoreIngredients.length || b.analysis.matchScore - a.analysis.matchScore);
+    const remaining = [...cookable, ...shopping].slice(0, 5);
+    const choices = remaining.map((entry, index) => {
+        const servings = entry.analysis.canCook ? Math.min(2, entry.analysis.feasibleServings) : 2;
+        const analysis = entry.analysis;
+        const missing = cookingPolicy.shoppingShortages(entry.recipe, analysis, servings);
+        return { type: 'DATABASE_RECIPE', recipeId: entry.recipe.recipeId, title: entry.recipe.title, canCook: entry.analysis.canCook, proposedServings: servings, missingIngredients: missing,
+            reasoning: entry.analysis.canCook ? buildTodaySuggestionReasoning(entry.recipe, entry.analysis) : 'Món đề xuất cần bổ sung nguyên liệu trước khi nấu.',
+            matchScore: entry.analysis.matchScore, feasibleServings: entry.analysis.feasibleServings, recommendationSessionId: sessionId, recommendationSource: 'RULE_DB', recommendationRank: index + 1 };
     });
+    if (choices[0]) choices[0].needsShopping = cookable.length === 0;
+    req.recipeMetrics.candidates = remaining.map(e => e.recipe);
+    return res.json({ success: true, data: { ...(choices[0] || { type: 'NEED_SHOPPING', reasoning: 'Kho chưa đủ để nấu. Hãy bổ sung thực phẩm hoặc tìm món để lên danh sách đi chợ.' }), choices, rotationReset, needsShopping: cookable.length === 0, recommendationSessionId: sessionId, recommendationSource: 'RULE_DB' } });
 });
 
 // Lấy món đề xuất bằng matcher xác định và tách riêng danh sách giải cứu.
 exports.getRecommendations = asyncHandler(async (req, res) => {
     const userId = req.user.userId;
-    const rankedRecipes = await rankRecipesForInventory(userId);
+    const { ranked: rankedRecipes, catalog } = await loadRankedSnapshot(userId, req.query.refresh === 'true');
     const suggestedRecipes = rankedRecipes
         .filter(entry => entry.analysis.matchScore > 0)
         .slice(0, 20)
@@ -399,11 +332,13 @@ exports.getRecommendations = asyncHandler(async (req, res) => {
         .slice(0, 10)
         .map(entry => entry.recipe);
     const suggestedRecipeIds = suggestedRecipes.map(recipe => recipe.recipeId);
-    const randomRecipes = await Recipe.aggregate([
-        { $match: { $and: [VISIBLE_RECIPE_CLAUSE, { recipeId: { $nin: suggestedRecipeIds } }] } },
-        { $sample: { size: 10 } },
-        { $project: publicRecipeProjection() }
-    ]);
+    // The catalog is already loaded; sample without another database round trip.
+    const randomPool = catalog.filter(recipe => !suggestedRecipeIds.includes(recipe.recipeId));
+    for (let i = randomPool.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [randomPool[i], randomPool[j]] = [randomPool[j], randomPool[i]];
+    }
+    const randomRecipes = randomPool.slice(0, 10).map(toPublicRecipe);
 
     console.log(`[API] ${req.method} ${req.originalUrl} - Get recommendations success (User: ${userId}, Suggested: ${suggestedRecipes.length})`);
     res.status(200).json({
@@ -417,73 +352,24 @@ exports.getRecommendations = asyncHandler(async (req, res) => {
 });
 
 // Nhờ AI tìm và tạo công thức mới (Khi DB k có)
-exports.aiSearchRecipe = asyncHandler(async (req, res) => {
-    const { query } = req.body;
-    if (!query) return res.status(400).json({ success: false, message: 'Thiếu query tìm kiếm' });
-
-    const prompt = `
-Bạn là một Đầu bếp chuẩn sao Michelin. Người dùng đang muốn tìm công thức cho món: "${query}".
-Hãy viết một công thức ngắn gọn, định lượng rõ và chuẩn xác cho món này. Trả về dưới định dạng JSON sau:
-{
-    "title": "Tên món",
-    "description": "Mô tả ngắn",
-    "dishType": "MAIN",
-    "cookingTimeMinutes": 30,
-    "baseServings": 2,
-    "ingredients": [
-        { "name": "Cá hoặc thịt chính", "amount": 300, "unit": "G", "required": true }
-    ],
-    "steps": ["Bước 1"],
-    "tags": []
-}
-Chỉ dùng unit G, KG, ML, L hoặc PIECE. Có tối đa 10 bước và mỗi bước tối đa hai câu.
-${AI_PORTION_RULES}
-Trả về CHỈ JSON, không giải thích thêm.
-`;
-    let result;
-    try {
-        // Dùng generateGeneralAdvice để tận dụng cơ chế Fallback và Timeout trung tâm
-        const responseText = await geminiService.generateGeneralAdvice(
-            'Bạn là đầu bếp AI. Chỉ trả về JSON hợp lệ theo schema yêu cầu, không giải thích thêm.',
-            prompt
-        );
-        result = JSON.parse(responseText.replace(/```json/gi, '').replace(/```/g, '').trim());
-    } catch (error) {
-        console.error("Error in aiSearchRecipe:", error);
-        throw new Error(error.message || "Lỗi khi gọi AI tạo công thức");
-    }
-
-    const newRecipeId = await allocateAiRecipeId();
-    const normalizedResult = normalizeGeneratedRecipe(result, {
-        title: query,
-        description: 'Sưu tầm bởi AI',
-        imageUrl: 'https://images.unsplash.com/photo-1546069901-ba9599a7e63c',
-        baseServings: 1
-    });
-    const newRecipe = new Recipe({
-        recipeId: newRecipeId,
-        ...normalizedResult,
-        source: 'AI',
-        dataVersion: 2
-    });
-
-    await newRecipe.save();
-
-    console.log(`[API] ${req.method} ${req.originalUrl} - AI search recipe success (Query: ${query})`);
-    res.status(200).json({
-        success: true,
-        data: toPublicRecipe(newRecipe)
-    });
-});
+exports.aiSearchRecipe = (req, res, next) => { req.body.createNew = true; return exports.ragSuggestRecipe(req, res, next); };
 
 // RAG theo yêu cầu chủ động của người dùng. Retrieval chỉ tạo context; AI trả
 // JSON có provenance, sau đó matcher kiểm tra lại đủ lượng/đơn vị/expiry.
-// AI draft được lưu DRAFT để có thể xem/nấu, nhưng không lẫn vào catalog chính.
+// Bản nháp nằm trong bộ nhớ cho tới khi người dùng chọn lưu.
 exports.ragSuggestRecipe = asyncHandler(async (req, res) => {
     const recommendationSessionId = req.recipeMetrics.sessionId;
+    const baseRecipeId = req.body?.baseRecipeId == null ? null : String(req.body.baseRecipeId).trim();
+    const fromInventory = req.body?.fromInventory === true;
+    const surprise = req.body?.surprise === true;
+    const createNew = req.body?.createNew === true || !baseRecipeId;
+    const excludedRecipeIds = parseExcludedRecipeIds(req.body?.excludeRecipeIds);
+    if (baseRecipeId && !/^[A-Za-z0-9_-]{1,160}$/.test(baseRecipeId)) {
+        return res.status(400).json({ success: false, code: 'INVALID_BASE_RECIPE', message: 'Mã công thức gốc không hợp lệ.' });
+    }
     let query;
     try {
-        query = recipeRagService.normalizeQuery(req.body?.query);
+        query = recipeRagService.normalizeQuery(surprise ? 'Tạo một biến thể món bất ngờ từ kho, ưu tiên thực phẩm sắp hết hạn, khác các món đã đề xuất. Không cần người dùng nhập yêu cầu.' : req.body?.query);
     } catch (error) {
         return res.status(error.statusCode || 400).json({
             success: false,
@@ -492,8 +378,17 @@ exports.ragSuggestRecipe = asyncHandler(async (req, res) => {
         });
     }
 
+    const rejection = cookingPolicy.validateIntent(query);
+    if (rejection) return res.status(200).json({ success: true, data: { type: 'REFUSED', reasoning: rejection } });
+    if (createNew) {
+      const escaped = escapeRegExp(query);
+      const canonicalQuery = require('../services/recipe-matching.service').canonicalizeName(query);
+      const existing = (await loadMatchingCatalog()).find(recipe => require('../services/recipe-matching.service').canonicalizeName(recipe.title) === canonicalQuery) || await Recipe.findOne({ $and: [VISIBLE_RECIPE_CLAUSE, { title: new RegExp(`^${escaped}$`, 'i') }] }).select(publicRecipeProjection()).lean();
+      if (existing) return res.json({ success: true, data: { type: 'RAG_ADAPTED_RECIPE', recipe: decorateRecipe(existing, analyzeRecipe(existing, await loadInventory(req.user.userId))), reasoning: 'Bộ công thức đã có món này, bạn có thể dùng ngay.', existingRecipe: true } });
+    }
     const inventorySnapshot = await loadInventory(req.user.userId);
-    if (inventorySnapshot.length === 0) {
+    const ragInventoryReport = inventoryService.generateInventoryReportFromSnapshot(inventorySnapshot);
+    if (surprise && (ragInventoryReport.isEmpty || ragInventoryReport.onlySpices)) {
         return res.status(200).json({
             success: true,
             data: {
@@ -507,7 +402,16 @@ exports.ragSuggestRecipe = asyncHandler(async (req, res) => {
 
     let retrieval;
     try {
-        retrieval = await recipeRagService.retrieveRecipeGrounding(query);
+        if (createNew && !baseRecipeId) { retrieval = { candidates: [], retrieval: 'GENERATION_FROM_QUERY' }; } else if (baseRecipeId) {
+            const baseRecipe = await Recipe.findOne({ recipeId: baseRecipeId }).select(publicRecipeProjection()).lean();
+            if (!baseRecipe) return res.status(404).json({ success: false, code: 'RECIPE_NOT_FOUND', message: 'Không tìm thấy công thức gốc.' });
+            retrieval = { candidates: [baseRecipe], retrieval: 'SELECTED_RECIPE' };
+        } else if (fromInventory) {
+            const ranked = await rankRecipesForInventory(req.user.userId, 400, inventorySnapshot);
+            retrieval = { candidates: ranked.filter(entry => entry.analysis.matchScore > 0).slice(0, 3).map(entry => entry.recipe), retrieval: 'INVENTORY_MATCHING' };
+        } else {
+            retrieval = await recipeRagService.retrieveRecipeGrounding(query);
+        }
     } catch (error) {
         return res.status(error.statusCode || 502).json({
             success: false,
@@ -516,7 +420,7 @@ exports.ragSuggestRecipe = asyncHandler(async (req, res) => {
         });
     }
 
-    if (retrieval.candidates.length === 0) {
+    if (!createNew && retrieval.candidates.length === 0) {
         return res.status(200).json({
             success: true,
             data: {
@@ -532,23 +436,28 @@ exports.ragSuggestRecipe = asyncHandler(async (req, res) => {
     try {
         req.recipeMetrics.source = 'RAG_GEMINI';
         completion = await geminiService.generateStructuredReceipt({
-            systemInstruction: 'Bạn trả lời JSON cho RAG công thức. Chỉ bám dữ liệu context và tuân thủ schema được yêu cầu.',
+            systemInstruction: createNew ? 'Bạn là đầu bếp thực tế. Tạo đúng món được yêu cầu, từ chối yêu cầu nguy hiểm hoặc không liên quan nấu ăn. Trả JSON theo schema; không giả vờ đã tìm kiếm web.' : 'Bạn tinh luyện công thức gốc bằng RAG. Giữ nguyên liệu chính và nhóm chế biến; trả JSON theo schema.',
             promptParts: [{
                 text: recipeRagService.buildRecipeRagPrompt({
                     query,
+                    createNew,
+                    randomVariant: surprise,
+                    excludedRecipeIds,
+                    baseRecipeId,
                     inventory: inventorySnapshot,
                     candidates: retrieval.candidates
                 })
             }],
             requestId: recommendationSessionId,
-            inputMode: 'recipe_rag'
+            inputMode: 'recipe_rag',
+            totalDeadlineMs: 30000
         });
     } catch (error) {
         req.recipeMetrics.provider = error.metadata;
         return res.status(error.statusCode || 502).json({
             success: false,
             code: error.code || 'RAG_MODEL_FAILED',
-            message: 'AI chưa thể tạo gợi ý lúc này. Bạn vẫn có thể tìm công thức trong catalog.'
+            message: error.code === 'AI_TIMEOUT' ? 'Cappy chưa phản hồi kịp. Yêu cầu của bạn vẫn được giữ; hãy thử lại.' : 'AI chưa thể tạo gợi ý lúc này. Bạn vẫn có thể tìm công thức trong catalog.'
         });
     }
 
@@ -557,22 +466,25 @@ exports.ragSuggestRecipe = asyncHandler(async (req, res) => {
     try {
         envelope = recipeRagService.validateRagEnvelope(
             recipeRagService.parseRagJson(completion.text),
-            retrieval.candidates
+            retrieval.candidates,
+            baseRecipeId,
+            createNew
         );
     } catch (error) {
+        console.warn('[Recipe AI validation]', { requestId: recommendationSessionId, mode: createNew ? 'CREATE' : 'RAG', code: error.code, reason: error.message });
         return res.status(error.statusCode || 422).json({
             success: false,
             code: error.code || 'INVALID_RAG_RESPONSE',
-            message: 'AI trả về gợi ý không đủ căn cứ; hệ thống đã không sử dụng kết quả này.'
+            message: 'Cappy chưa trả về công thức hoàn chỉnh. Bạn có thể thử lại.'
         });
     }
 
     const ragMetadata = recipeRagService.toRagMetadata(completion.metadata, retrieval);
-    if (envelope.mode === 'NEED_SHOPPING') {
+    if (['NEED_SHOPPING', 'REFUSED', 'CLARIFY'].includes(envelope.mode)) {
         return res.status(200).json({
             success: true,
             data: {
-                type: 'NEED_SHOPPING',
+                type: envelope.mode === 'NEED_SHOPPING' ? 'NEED_SHOPPING' : envelope.mode,
                 reasoning: envelope.reasoning || 'Các công thức tham chiếu hiện chưa phù hợp với kho.',
                 sourceRecipeIds: envelope.baseRecipeIds,
                 rag: ragMetadata
@@ -588,13 +500,24 @@ exports.ragSuggestRecipe = asyncHandler(async (req, res) => {
             baseServings: 1
         });
     } catch (error) {
+        console.warn('[Recipe AI recipe validation]', { requestId: recommendationSessionId, code: error.code, reason: error.message });
         return res.status(error.statusCode || 422).json({
             success: false,
             code: error.code || 'INVALID_RAG_RECIPE',
-            message: 'Công thức AI không đạt điều kiện định lượng tối thiểu nên không được sử dụng.'
+            message: `Cappy chưa dùng được công thức này: ${error.message || 'Dữ liệu nguyên liệu chưa hợp lệ.'}`
         });
     }
 
+    const unsafeOutput = [normalizedRecipe.title, ...normalizedRecipe.ingredients.map(item => item.name)].map(value => cookingPolicy.validateIntent(value)).find(Boolean);
+    if (unsafeOutput) return res.json({ success: true, data: { type: 'REFUSED', reasoning: unsafeOutput } });
+
+    const invalidDish = createNew ? cookingPolicy.validateRequestedDish(query, normalizedRecipe) : null;
+    if (invalidDish) return res.status(422).json({ success: false, code: 'AI_DISH_MISMATCH', message: invalidDish });
+    const base = retrieval.candidates[0];
+    if (!createNew && base) {
+      const invalid = cookingPolicy.validateRefinement(base, normalizedRecipe, query);
+      if (invalid) return res.json({ success: true, data: { type: 'CLARIFY', reasoning: invalid } });
+    }
     const candidateRecipe = new Recipe({
         // ID tạm chỉ dùng cho phân tích trong memory. Không tạo sequence/draft
         // khi matcher kết luận công thức chưa thể nấu từ kho thực tế.
@@ -604,12 +527,13 @@ exports.ragSuggestRecipe = asyncHandler(async (req, res) => {
         status: 'DRAFT',
         dataVersion: 2
     });
+    if (candidateRecipe.validateSync()) return res.status(422).json({ success: false, code: 'INVALID_RAG_RECIPE', message: 'Công thức AI chưa đạt cấu trúc dữ liệu để lưu.' });
     const analysis = analyzeRecipe(candidateRecipe, inventorySnapshot);
     req.recipeMetrics.candidates = [decorateRecipe(candidateRecipe, analysis)];
 
     // Matcher là quyết định cuối. Không lưu hoặc trả một món "có thể nấu" nếu
     // còn thiếu core ingredient, không tương thích đơn vị, hoặc cần review.
-    if (!analysis.canCook) {
+    if (surprise && !analysis.canCook) {
         return res.status(200).json({
             success: true,
             data: {
@@ -624,7 +548,9 @@ exports.ragSuggestRecipe = asyncHandler(async (req, res) => {
     }
 
     candidateRecipe.recipeId = await allocateAiRecipeId();
-    await candidateRecipe.save();
+    const savable = createNew || cookingPolicy.isCatalogVariant(base, normalizedRecipe);
+    const draftToken = draftStore.put(req.user.userId, { ...normalizedRecipe, recipeId: candidateRecipe.recipeId, baseRecipeId: baseRecipeId || null }, recommendationSessionId);
+    draftStore.get(req.user.userId, draftToken).savable = savable;
     
     console.info('[Recipe RAG]', {
         userId: req.user.userId,
@@ -638,6 +564,11 @@ exports.ragSuggestRecipe = asyncHandler(async (req, res) => {
         success: true,
         data: {
             type: 'RAG_ADAPTED_RECIPE',
+            draftToken,
+            savable,
+            changes: envelope.changes,
+            baseRecipeId,
+            sourceRecipes: retrieval.candidates.filter(recipe => envelope.baseRecipeIds.includes(recipe.recipeId)).map(recipe => ({ recipeId: recipe.recipeId, title: recipe.title })),
             reasoning: envelope.reasoning,
             sourceRecipeIds: envelope.baseRecipeIds,
             recipe: decorateRecipe(candidateRecipe, analysis),
@@ -647,6 +578,38 @@ exports.ragSuggestRecipe = asyncHandler(async (req, res) => {
             rag: ragMetadata
         }
     });
+});
+
+// Chỉ lưu khi người dùng chọn; token gắn người dùng và chống lưu lặp trong phiên.
+exports.saveRagDraft = asyncHandler(async (req, res) => {
+ const entry = draftStore.get(req.user.userId, req.body?.draftToken);
+ if (!entry) return res.status(410).json({ success: false, code: 'DRAFT_EXPIRED', message: 'Bản nháp đã hết hạn. Hãy mở món mới.' });
+ if (entry.savable === false) return res.status(422).json({ success: false, code: 'SESSION_ONLY', message: 'Điều chỉnh khẩu vị/khẩu phần chỉ dùng trong phiên, không tạo công thức trùng.' });
+ if (!entry.saving) {
+  const titleKey = require('../services/recipe-matching.service').canonicalizeName(entry.recipe.title);
+  if (!catalogSaveJobs.has(titleKey)) {
+   const job = (async () => {
+    const regex = new RegExp(`^${escapeRegExp(entry.recipe.title)}$`, 'i');
+    const existing = (await loadMatchingCatalog()).find(recipe => require('../services/recipe-matching.service').canonicalizeName(recipe.title) === titleKey) || await Recipe.findOne({ $and: [VISIBLE_RECIPE_CLAUSE, { title: regex }] }).select(publicRecipeProjection()).lean();
+    if (existing) return existing;
+    const recipe = new Recipe({ ...entry.recipe, recipeId: entry.recipe.recipeId, source: 'AI', status: 'ACTIVE', dataVersion: 2 });
+    await recipe.save(); catalogCache.expires = 0;
+    Promise.resolve().then(() => require('../services/recipe-embedding.service').embedRecipeDocument(recipe)).then(vector => Recipe.updateOne({ recipeId: recipe.recipeId }, { $set: { embeddingVector: vector, embeddingModel: require('../services/recipe-embedding.service').EMBEDDING_MODEL, embeddingVersion: 'recipe-v3' } })).catch(error => console.warn('[Recipe embedding]', error.message));
+    return toPublicRecipe(recipe);
+   })();
+   catalogSaveJobs.set(titleKey, job);
+   job.finally(() => catalogSaveJobs.delete(titleKey)).catch(() => {});
+  }
+  entry.saving = catalogSaveJobs.get(titleKey).catch(error => { entry.saving = null; throw error; });
+ }
+ const storedRecipe = await entry.saving;
+ const recipe = decorateRecipe(storedRecipe, analyzeRecipe(storedRecipe, await loadInventory(req.user.userId)));
+ await require('../models/user.model').updateOne({ _id: req.user.userId }, { $addToSet: { savedRecipes: recipe.recipeId } });
+ if (!entry.saveObserved) {
+  entry.saveObserved = true;
+  aiMetricsService.logRecipeSaved({ userId: req.user.userId, sessionId: entry.sessionId, recipeId: recipe.recipeId });
+ }
+ return res.json({ success: true, data: { ...recipe, recommendationSessionId: entry.sessionId, recommendationSource: 'RAG_GEMINI', recommendationRank: 1 } });
 });
 
 // Hoàn tất nấu: preflight toàn bộ -> FEFO -> transaction, không trừ dở dang.
@@ -664,9 +627,13 @@ exports.cookRecipe = asyncHandler(async (req, res) => {
         });
     }
 
-    const recipe = await Recipe.findOne({ recipeId })
+    const persistedRecipe = await Recipe.findOne({ recipeId })
         .select(publicRecipeProjection())
         .lean();
+    const originalRecipe = persistedRecipe || draftStore.findRecipe(userId, recipeId);
+    let recipe = originalRecipe;
+    try { if (originalRecipe) recipe = cookingPolicy.applySubstitutions(originalRecipe, req.method === 'GET' ? JSON.parse(req.query.substitutions || '[]') : (req.body.substitutions || [])); }
+    catch (error) { return res.status(400).json({ success: false, message: error.message }); }
     if (!recipe) return res.status(404).json({ success: false, message: 'Không tìm thấy công thức' });
 
     const previousResult = await Item.findOne({
@@ -768,6 +735,7 @@ exports.cookRecipe = asyncHandler(async (req, res) => {
                 standardQuantity: Number(cookedServings),
                 standardUnit: 'PIECE',
                 purchasePrice: cookedFoodValue / Number(cookedServings),
+                baseUnitPrice: cookedFoodValue / Number(cookedServings),
                 expiryDate: expiry,
                 storageLocation: 'FRIDGE',
                 expirySource: 'ESTIMATED_RULE',

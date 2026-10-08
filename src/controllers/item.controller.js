@@ -3,6 +3,7 @@ const Item = require('../models/item.model');
 const Transaction = require('../models/transaction.model');
 const Notification = require('../models/notification.model');
 const RpgLog = require('../models/rpgLog.model');
+const { wasteValue } = require('../services/waste-value.service');
 const { asyncHandler } = require('../middleware/errorHandler.middleware');
 const {
     calculateBaseUnitPrice,
@@ -146,6 +147,7 @@ exports.getItems = asyncHandler(async (req, res) => {
                 unit: { $first: '$unit' },
                 standardUnit: { $first: '$standardUnit' },
                 category: { $first: '$category' },
+                isCookedMeal: { $first: '$isCookedMeal' },
                 subCategory: { $first: '$subCategory' },
                 storageLocation: { $first: '$resolvedStorageLocation' },
                 expirySource: { $first: '$expirySource' },
@@ -690,7 +692,7 @@ exports.batchUpdate = asyncHandler(async (req, res) => {
                     const deductedQty = Math.min(batch.quantity, neededQty);
                     const deductedStdQty = deductedQty / ratio;
                     if (consume.isWasted && deductedQty > 0) {
-                        const financialWaste = (deductedQty / batch.originalQuantity) * batch.purchasePrice;
+                        const financialWaste = wasteValue(batch, deductedQty);
                         totalWastedValue += financialWaste;
                         hasWasted = true;
                         if (deductedQty < batch.quantity) {
@@ -706,7 +708,7 @@ exports.batchUpdate = asyncHandler(async (req, res) => {
                         neededStdQty -= batch.standardQuantity; // Cũng trừ stdQty tương ứng
                         
                         const updateObj = consume.isWasted 
-                            ? { $set: { usageStatus: 'WASTED' } }
+                            ? { $set: { usageStatus: 'WASTED', purchasePrice: wasteValue(batch, batch.quantity) } }
                             : { $set: { quantity: 0, standardQuantity: 0, usageStatus: 'CONSUMED' } };
                             
                         bulkOps.push({
@@ -732,7 +734,7 @@ exports.batchUpdate = asyncHandler(async (req, res) => {
                     const deductedStdQty = Math.min(batch.standardQuantity, neededStdQty);
                     const deductedQty = Number((deductedStdQty * ratio).toFixed(8));
                     if (consume.isWasted && deductedStdQty > 0) {
-                        const financialWaste = (deductedQty / batch.originalQuantity) * batch.purchasePrice;
+                        const financialWaste = wasteValue(batch, deductedQty);
                         totalWastedValue += financialWaste;
                         hasWasted = true;
                         if (deductedStdQty < batch.standardQuantity) {
@@ -748,7 +750,7 @@ exports.batchUpdate = asyncHandler(async (req, res) => {
                         neededQty -= batch.quantity;
                         
                         const updateObj = consume.isWasted 
-                            ? { $set: { usageStatus: 'WASTED' } }
+                            ? { $set: { usageStatus: 'WASTED', purchasePrice: wasteValue(batch, batch.quantity) } }
                             : { $set: { quantity: 0, standardQuantity: 0, usageStatus: 'CONSUMED' } };
                             
                         bulkOps.push({
@@ -788,7 +790,7 @@ exports.batchUpdate = asyncHandler(async (req, res) => {
             await Item.bulkWrite(bulkOps, { session });
         }
         if (wasteLedgerItems.length > 0) {
-            await Item.create(wasteLedgerItems, { session });
+            await Item.create(wasteLedgerItems, { session, ordered: true });
         }
 
         let createdRpgLogId = null;

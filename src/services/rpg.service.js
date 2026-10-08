@@ -23,6 +23,8 @@ exports.calculateRpgState = ({
     totalCycleDays = 0,
     inventoryValue = 0,
     expiredInventoryValue = 0,
+    soonExpiringInventoryValue = 0,
+    cycleWisBonus = 0,
     wastedValue = 0,
     bonusWis = 0,
     calculatedAt = new Date()
@@ -86,6 +88,7 @@ exports.calculateRpgState = ({
                 ['USABLE_INVENTORY_VALUE', usableInventoryValue],
                 ['TOTAL_INVENTORY_VALUE', safeInventoryValue],
                 ['EXPIRED_INVENTORY_VALUE', safeExpiredInventoryValue],
+                ['AT_RISK_INVENTORY_VALUE', safeExpiredInventoryValue + toAmount(soonExpiringInventoryValue)],
                 ['REQUIRED_SURVIVAL_FUNDS', requiredSurvivalFunds],
                 ['DAILY_ESSENTIAL_NEED', dailyEssentialNeed],
                 ['DAYS_REMAINING', safeDaysRemaining]
@@ -97,7 +100,7 @@ exports.calculateRpgState = ({
                 ['SHORTFALL', Math.max(0, requiredHoldCash - freeCash)]
             ]),
             def: factors([['SAVINGS_FUND', safeSavingsFund], ['ESSENTIAL_BUDGET', safeEssentialBudget]]),
-            wis: factors([['BASELINE', WIS_BASELINE], ['BONUS_WIS', safeBonusWis], ['WASTE_PENALTY', wastePenalty], ['WASTED_VALUE', safeWastedValue]]),
+            wis: factors([['BASELINE', WIS_BASELINE], ['BONUS_WIS', safeBonusWis], ['CYCLE_BONUS_WIS', toAmount(cycleWisBonus)], ['WASTE_PENALTY', wastePenalty], ['WASTED_VALUE', safeWastedValue]]),
             status: {
                 hp: budgetConfigured ? 'OK' : 'UNCONFIGURED_BUDGET',
                 mana: budgetConfigured ? 'OK' : 'UNCONFIGURED_FLEXIBLE_BUDGET',
@@ -129,6 +132,15 @@ exports.calculateUserStats = async (userId) => {
             return sum + exports.inventoryValue(item, now);
         }, 0);
 
+        const soonExpiringInventoryValue = activeItems.reduce((sum, item) => {
+            if (!item.expiryDate) return sum;
+            const days = moment(item.expiryDate).tz(finance.TZ).startOf('day').diff(moment(now).tz(finance.TZ).startOf('day'), 'days');
+            return sum + (days >= 0 && days <= 3 ? exports.inventoryValue(item, now) : 0);
+        }, 0);
+        const rewardTotals = await require('../models/transaction.model').aggregate([
+            { $match: { userId: user._id, ...finance.NORMAL_FILTER, date: { $gte: startDate, $lte: now }, 'gamificationRewards.wisBonus': { $gt: 0 } } },
+            { $group: { _id: null, total: { $sum: '$gamificationRewards.wisBonus' } } }
+        ]);
         // Lấy các món bị vứt bỏ (Wasted) trong chu kỳ này để trừ điểm WIS
         const wastedItems = await Item.find({
             userId,
@@ -140,9 +152,10 @@ exports.calculateUserStats = async (userId) => {
         const state = exports.calculateRpgState({
             cashBalance: account.cash, balanceInitialized: account.initialized, unpaidFixedCosts: account.unpaidFixed,
             essentialBudget, savingsFund: account.savings, daysRemaining, totalCycleDays,
-            inventoryValue, expiredInventoryValue, wastedValue,
+            inventoryValue, expiredInventoryValue, soonExpiringInventoryValue, cycleWisBonus: rewardTotals[0]?.total || 0, wastedValue,
             bonusWis: user.rpgStats?.bonusWis || 0, calculatedAt: now
         });
+        state.statBreakdown.explanation = require('./survival-explanation.service').build(state);
         // User cũ có thể chưa có subdocument này; gán lazily để không cần migration.
         user.rpgStats ||= {};
         // Chỉ ghi các field tương thích ngược vào subdocument hiện có.

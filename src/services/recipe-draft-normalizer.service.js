@@ -1,5 +1,6 @@
 'use strict';
 
+const { canonicalizeName } = require('./recipe-matching.service');
 const VALID_UNITS = new Set(['G', 'KG', 'ML', 'L', 'PIECE']);
 const VALID_DISH_TYPES = new Set(['MAIN', 'SIDE', 'SOUP', 'DRINK', 'DESSERT', 'SNACK']);
 const {
@@ -31,9 +32,21 @@ function normalizeGeneratedRecipe(input, defaults = {}) {
         const name = compact(item?.name || item?.itemName || item?.canonicalName, 120);
         const amount = Number(item?.amount);
         const unit = compact(item?.unit).toUpperCase();
-        if (!name || !Number.isFinite(amount) || amount <= 0 || !VALID_UNITS.has(unit)) {
+        const presenceOnly = unit === 'NONE' && amount === 0 && !(item.required ?? item.isCore);
+        if (!name || !Number.isFinite(amount) || (!presenceOnly && (amount <= 0 || !VALID_UNITS.has(unit)))) {
             throw validationError(`Nguyên liệu AI thứ ${index + 1} không hợp lệ.`);
         }
+        const identity = canonicalizeName(name);
+        const water = /^(nuoc loc|nuoc sach|nuoc uong)$/.test(identity);
+        const role = item.role == null ? null : String(item.role).toUpperCase();
+        if (role && !['MAIN', 'SECONDARY', 'SEASONING'].includes(role)) throw validationError('Vai trò nguyên liệu không hợp lệ.');
+        if (item.purchaseRequired != null && typeof item.purchaseRequired !== 'boolean') throw validationError('purchaseRequired phải là boolean.');
+        // Plain water is an instruction quantity, never stock or a shopping item.
+        // Normalize these flags deterministically; do not exempt any food.
+        const purchaseRequired = water ? false : item.purchaseRequired ?? true;
+        if (!purchaseRequired && !water) throw validationError('Thực phẩm và gia vị vẫn cần đối chiếu kho hoặc đưa vào đi chợ.');
+        if (/^nuoc (dung|leo|luoc)/.test(identity) && !/goi|dong goi|hop|chai/.test(identity)) throw validationError('Cần liệt kê nguyên liệu nấu nước dùng hoặc gói nước dùng mua được, không liệt kê thành phẩm tự nấu.');
+        if (/thit cua.*luoc san/.test(identity) && !/dong goi|hop|mua san/.test(identity)) throw validationError('Cần ghi cua nguyên liệu hoặc thịt cua sơ chế đóng gói, không ghi chung chung thịt cua luộc sẵn.');
         const requestedScalingMode = compact(item?.scalingMode).toUpperCase();
         const hasRequestedScalingMode = ['PROPORTIONAL', 'WHOLE_UNIT', 'FIXED_MINIMUM', 'NON_SCALABLE'].includes(requestedScalingMode);
         const scalingMode = hasRequestedScalingMode
@@ -42,9 +55,11 @@ function normalizeGeneratedRecipe(input, defaults = {}) {
         const wholeUnitStep = Number(item?.wholeUnitStep);
         return {
             name,
+            ...(item.purchaseRequired != null || water ? { purchaseRequired } : {}),
+            ...(role ? { role } : {}),
             amount,
             unit,
-            required: Boolean(item?.required ?? item?.isCore),
+            required: water ? false : Boolean(item?.required ?? item?.isCore),
             ...(scalingMode ? {
                 scalingMode,
                 wholeUnitStep: scalingMode === 'WHOLE_UNIT' && Number.isFinite(wholeUnitStep) && wholeUnitStep > 0

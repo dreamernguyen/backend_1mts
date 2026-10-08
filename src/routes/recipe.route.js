@@ -10,6 +10,7 @@ router.get('/search', recipeController.searchRecipes);
 router.get('/recommendations', recipeController.getRecommendations);
 router.post('/ai-search', recipeController.aiSearchRecipe);
 router.post('/rag-suggest', recipeController.ragSuggestRecipe);
+router.post('/rag-save', recipeController.saveRagDraft);
 router.post('/cook', recipeController.cookRecipe);
 router.get('/suggest-today', recipeController.suggestTodayRecipe);
 router.get('/:id/details', recipeController.getRecipeDetails);

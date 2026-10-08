@@ -40,7 +40,7 @@ async function allocateAiRecipeId() {
                 }
             }
         }],
-        { upsert: true, new: true }
+        { upsert: true, new: true, updatePipeline: true }
     ).lean();
     return formatAiRecipeId(counter.value);
 }

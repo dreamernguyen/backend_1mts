@@ -56,7 +56,11 @@ const userSchema = new mongoose.Schema(
             unique: true, 
             trim: true
         },
-        monthlyBudget: {
+    demoData: {
+        version: String,
+        seededAt: Date
+    },
+    monthlyBudget: {
             type: Number,
             default: 0,
             min: 0

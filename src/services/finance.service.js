@@ -30,19 +30,9 @@ function cycleDates(day = 1, instant = new Date()) {
 }
 
 function userCycle(user, instant = new Date()) {
-    const pending = user.finance?.pendingCycleAt;
-    // Kỳ chuyển tiếp bắt đầu tại biên cũ, kết thúc ở ngày lương mới kế tiếp.
-    if (pending && new Date(instant) >= new Date(pending)) {
-        const regular = cycleDates(user.finance.pendingCycleDay, instant);
-        if (regular.startDate < new Date(pending)) {
-            regular.startDate = new Date(pending);
-            regular.key = moment(pending).tz(TZ).format('YYYY-MM-DD');
-            regular.totalDays = moment(regular.endExclusive).diff(moment(pending), 'days');
-            regular.daysPassed = moment(instant).tz(TZ).startOf('day').diff(moment(pending), 'days') + 1;
-        }
-        return regular;
-    }
-    return cycleDates(user.cycleStartDay || 1, instant);
+    // A pending day from older clients is interpreted as the selected full cycle.
+    // Existing fixed-cost ledgers remain intact; this changes reporting boundaries.
+    return cycleDates(user.finance?.pendingCycleDay || user.cycleStartDay || 1, instant);
 }
 
 function balanceFromTransactions(user, transactions) {

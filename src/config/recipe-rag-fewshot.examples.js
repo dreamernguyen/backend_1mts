@@ -2,7 +2,7 @@
 
 // Few-shot chỉ định dạng đầu ra và nguyên tắc bám context. Ví dụ không phải
 // nguồn dữ liệu để AI suy diễn thêm nguyên liệu hay số lượng cho người dùng.
-const RECIPE_RAG_PROMPT_VERSION = 'recipe-rag-v1-fewshot';
+const RECIPE_RAG_PROMPT_VERSION = 'recipe-rag-v5-practical-ingredients';
 
 const RECIPE_RAG_FEW_SHOT_EXAMPLES = Object.freeze([
     {
@@ -19,14 +19,16 @@ const RECIPE_RAG_FEW_SHOT_EXAMPLES = Object.freeze([
                 baseServings: 1,
                 ingredients: [
                     { name: 'ức gà', amount: 150, unit: 'G', required: true },
-                    { name: 'cải thìa', amount: 120, unit: 'G', required: true }
+                    { name: 'cải thìa', amount: 120, unit: 'G', required: true },
+                    { name: 'dầu ăn', amount: 10, unit: 'ML', required: true },
+                    { name: 'muối', amount: 0, unit: 'NONE', required: false }
                 ],
-                steps: ['Sơ chế nguyên liệu.', 'Xào gà chín tới rồi cho rau vào.']
+                steps: ['Rửa cải thìa, cắt khúc; thái ức gà mỏng.', 'Làm nóng dầu trong chảo, xào gà khoảng 5–7 phút đến chín hoàn toàn.', 'Cho cải thìa vào xào thêm 2–3 phút, đảo đều đến khi rau chín.', 'Nêm muối vừa ăn và dùng nóng; kiểm tra thịt gà không còn sống bên trong.']
             }
         }
     },
     {
-        userIntent: 'Muốn nấu món từ kho hiện tại nhưng thiếu nguyên liệu chính.',
+        userIntent: 'randomVariant=true: thử biến thể từ kho nhưng thiếu nguyên liệu chính.',
         expected: {
             mode: 'NEED_SHOPPING',
             baseRecipeIds: ['CT_205'],

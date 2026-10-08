@@ -918,47 +918,55 @@ exports.getFinanceInsight = asyncHandler(async (req, res) => {
     return res.status(200).json({ success: true, data: { snapshot, insight, fallbackUsed, cached: false } });
 });
 
+const contextualAdvice = require('../services/contextual-advice.service');
 exports.getAdviceInsight = asyncHandler(async (req, res) => {
     const userId = req.user.userId;
-    const aiSessionId = req.id || `general-advice-${Date.now()}`;
-    const insightStartedAt = Date.now();
-    const user = await User.findById(userId).lean();
-    if (!user) return res.status(404).json({ success: false, message: 'Khong tim thay nguoi dung' });
-    
-    const rpgSvc = require('../services/rpg.service');
-    const rpgStats = await rpgSvc.calculateUserStats(userId);
-    
-    const Item = require('../models/item.model');
-    const activeItems = await Item.find({ userId, usageStatus: 'ACTIVE' }).limit(20).lean();
-    const itemsList = activeItems.map(i => `- ${i.itemName} (Còn ${i.quantity} ${i.unit})`).join('\n');
-    
-    const promptText = `
-Tài chính hiện tại:
-- HP: ${rpgStats.hp}%
-- MANA: ${rpgStats.mana} VND
-- DEF: ${rpgStats.def}%
-- WIS: ${rpgStats.wis}%
-- Phân tích xác định từ tiền thực có (không được coi ngân sách là tiền mặt): ${JSON.stringify(rpgStats.statBreakdown)}
-
-Thực phẩm trong tủ:
-${itemsList || 'Trống'}
-
-Hãy đưa ra 1 lời khuyên sắc bén, hài hước và mang tính chiến thuật (Mách nước) khoảng 2-3 câu để giúp tôi sống sót qua tháng này.
-YÊU CẦU QUAN TRỌNG:
-1. KHÔNG được nhắc lại các con số HP, MANA, DEF, WIS (người dùng đã nhìn thấy trên màn hình).
-2. Tập trung chỉ ra MỐI LIÊN HỆ giữa túi tiền hiện tại và đồ ăn trong tủ, từ đó gợi ý một HÀNH ĐỘNG CỤ THỂ ngay hôm nay (ví dụ: cấm ăn hàng, nấu món gì, hay xõa đi).
-3. Câu văn tự nhiên, ngắn gọn, giống một người bạn đang "mách nước" chứ không phải báo cáo tài chính.
-`;
-
-    const systemInstruction = 'Bạn là NPC Cố vấn Sinh tồn cực kỳ thông minh, hài hước, và có chút cà khịa. Đưa ra lời khuyên ngắn gọn, dễ hiểu dựa trên ngân sách và tủ lạnh của người dùng. Trả về text thuần.';
-    try {
-        const ai = await geminiService.generateGeneralAdvice(systemInstruction, promptText);
-        aiMetricsService.logInsightMetric({ userId, sessionId: aiSessionId, subFeature: 'GENERAL_ADVICE', latencyMs: ai.metadata?.durationMs ?? Date.now() - insightStartedAt, aiModel: ai.metadata?.model ?? null });
-        return res.status(200).json({ success: true, advice: ai.text });
-    } catch (error) {
-        aiMetricsService.logInsightMetric({ userId, sessionId: aiSessionId, subFeature: 'GENERAL_ADVICE', eventType: 'AI_ERROR', resultStatus: 'ERROR', latencyMs: Date.now() - insightStartedAt, error });
-        return res.status(error.statusCode || 503).json({ success: false, code: error.code || 'AI_UNAVAILABLE', message: 'Chưa thể tạo lời khuyên lúc này. Vui lòng thử lại.' });
-    }
+    const started = Date.now();
+    const since = new Date(Date.now() - 7 * 86400000);
+    const [user, stats, transactions, items] = await Promise.all([
+        User.findById(userId).select('monthlyBudget essentialBudget fixedBudget cycleStartDay finance').lean(),
+        rpgService.calculateUserStats(userId),
+        Transaction.find({ userId, ...finance.NORMAL_FILTER, date: { $gte: since, $lte: new Date() } }).sort({ date: -1, _id: -1 }).limit(15)
+            .select('date description note category amount transactionType').lean(),
+        Item.find({ userId, usageStatus: 'ACTIVE', quantity: { $gt: 0 } }).sort({ expiryDate: 1, _id: 1 })
+            .select('itemName quantity unit standardQuantity standardUnit storageLocation expiryDate expirySource category isCookedMeal purchasePrice usageStatus').lean()
+    ]);
+    if (!user || !stats) return res.status(404).json({ success: false, message: 'Không tìm thấy dữ liệu tài chính.' });
+    const account = await finance.snapshot(user);
+    const periodTotals = await Transaction.aggregate([
+        { $match: { userId: new mongoose.Types.ObjectId(userId), ...finance.NORMAL_FILTER,
+            date: { $gte: account.cycle.startDate, $lt: account.cycle.endExclusive, $lte: new Date() } } },
+        { $group: { _id: { type: '$transactionType', category: '$category' }, amount: { $sum: '$amount' }, count: { $sum: 1 } } }
+    ]);
+    const context = contextualAdvice.snapshot(stats, transactions, items, { monthlyBudget: user.monthlyBudget, essentialBudget: user.essentialBudget, fixedBudget: user.fixedBudget, cycleStartDay: user.cycleStartDay });
+    context.account = { cash: account.cash, savings: account.savings, unpaidFixed: account.unpaidFixed, fixedCosts: account.fixedCosts, cycle: { key: account.cycle.key, startDate: account.cycle.startDate, endExclusive: account.cycle.endExclusive, daysRemaining: account.cycle.daysRemaining, totalDays: account.cycle.totalDays } };
+    Object.assign(context.budgetGuide, {
+        foodBudgetPerCycle: Number(user.essentialBudget) || 0,
+        plannedBudgetPerCycle: Number(user.monthlyBudget) || 0,
+        totalCycleDays: account.cycle.totalDays,
+        cycleStart: account.cycle.startDate,
+        cycleEndExclusive: account.cycle.endExclusive,
+        effectiveCycleStartDay: new Date(account.cycle.startDate).toLocaleString('en-US', { timeZone: finance.TZ, day: 'numeric' }),
+        configuredCycleStartDay: user.cycleStartDay || 1,
+        transitionCycle: !!user.finance?.pendingCycleAt && new Date() >= new Date(user.finance.pendingCycleAt)
+            && account.cycle.totalDays < 28,
+        calculationNote: 'Định mức ăn/ngày = ngân sách ăn / số ngày thực tế của kỳ. Kỳ chuyển tiếp khi đổi ngày bắt đầu có thể ngắn hơn tháng. Giá trị kho gồm đồ ACTIVE quá hạn ghi nhận theo công thức RPG hiện tại.'
+    });
+    context.periodTransactionTotals = periodTotals;
+    const result = await contextualAdvice.resolve(String(userId), context, snapshot => geminiService.generateContextualAdvice({
+        requestId: req.requestId || req.id, systemInstruction: contextualAdvice.instruction, prompt: contextualAdvice.buildPrompt(snapshot)
+    }), req.body?.refresh === true);
+    const sessionId = req.requestId || req.id || `advice-${Date.now()}`;
+    console.info('[Capy Insight]', { requestId: sessionId, source: result.fallbackUsed ? 'RULE_DB' : 'GEMINI', fallbackUsed: result.fallbackUsed, cacheHit: result.cached, errorCode: result.errorCode || null, providerMs: result.providerMs, totalMs: Date.now() - started });
+    aiMetricsService.logInsightMetric({ userId, sessionId, subFeature: 'GENERAL_ADVICE',
+        engine: result.fallbackUsed ? 'RULE_DB' : 'GEMINI', resultStatus: result.fallbackUsed ? 'FALLBACK' : 'SUCCESS',
+        latencyMs: Date.now() - started, modelLatencyMs: result.providerMs, cacheHit: result.cached, aiModel: result.aiModel,
+        error: result.errorCode ? { code: result.errorCode } : null, pipelineVersion: contextualAdvice.PIPELINE_VERSION,
+        providerAttempts: result.cached ? 0 : result.providerMetadata?.providerAttemptCount,
+        providerAttemptDetails: result.cached ? [] : (result.providerMetadata?.attempts || []).map(a => ({ model: a.model, durationMs: a.durationMs, status: a.status, code: a.errorCode })),
+        tokenUsage: result.cached ? { input: 0, output: 0, total: 0 } : { input: result.providerMetadata?.promptTokenCount, output: result.providerMetadata?.candidatesTokenCount, total: result.providerMetadata?.totalTokenCount } });
+    return res.json({ success: true, advice: [result.insight.analysis, result.insight.advice, result.insight.inventoryReminder].filter(Boolean).join('\n\n'),
+        data: { ...result, sessionId, budgetGuide: context.budgetGuide, evidence: { transactions: context.recentTransactions, inventory: context.inventory } } });
 });
 
 exports.getSurvivalInsight = asyncHandler(async (req, res) => {

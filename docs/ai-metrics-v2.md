@@ -129,3 +129,18 @@ db.aimetrics.aggregate([
 ```
 
 Không chạy các truy vấn này tự động. Collection thực tế kiểm tra bằng `show collections`; Mongoose mặc định tạo `aimetrics`.
+
+## Contextual Capy Insight — 06/10/2026
+- POST insights/advice nhận chỉ số/breakdown, ngân sách, tối đa 15 giao dịch mới nhất trong 7 ngày và 80 item ACTIVE có lượng >0. Bao gồm storageLocation, expirySource, daysRemaining; tổng nhóm là tổng mẫu giao dịch, không phải tổng toàn bộ kỳ. Chưa suy luận xu hướng 7 ngày so với kỳ trước hoặc ngân sách đi lại khi không có thiết lập.
+- JSON headline/analysis/advice/inventoryReminder/evidenceIds/actionCode; giới hạn độ dài, ID chứng cứ và action. Không matcher; món gợi ý chỉ là hướng chế biến. Hạn đang ghi nhận quá hạn được nhắc kiểm tra theo bảo quản và nguồn hạn, không tự xác nhận an toàn.
+- Một kết quả cuối GENERAL_ADVICE/lượt: server latency và provider latency riêng, cacheHit; fallback ghi mã lỗi. endToEndLatencyMs để null vì chưa đo UI. Không dùng tỷ lệ validation làm accuracy. Các endpoint finance/survival cũ còn tương thích, UI không tự gọi chúng.
+- Cache RAM 5 phút, tối đa 100 entry, hash theo dữ liệu và ngày Việt Nam, bỏ calculatedAt; tác vụ đồng thời cùng hash dùng chung provider. Cache không sửa dữ liệu tài chính hoặc kho. Chưa ghi click-rate/thời gian hiển thị trong aiMetrics cho UI mới.
+- UI sheet chung từ pet: tình thế/nước đi/nhắc kho, giải thích RPG mở rộng, bỏ report popup lặp. Lỗi tải không ảnh hưởng số liệu; lỗi provider có advice fallback.
+- Giữ công thức RPG, không migration. Cần đo latency thực tế và đánh giá lời tư vấn trên 15–20 bối cảnh; validation hiện kiểm tra cấu trúc/references, không chứng minh mọi câu AI đúng.
+
+## Detailed few-shot Insight — 07/10/2026
+- 9 fictional examples in src/config/insight-fewshot.examples.js; select at most 2 by situation, never use example IDs/numbers as current evidence.
+- Detailed 300–450 word response when enough context; analysis/advice/reminder length bounds 2400/1400/900 characters. Existing JSON contract/UI sections preserved.
+- Added real cycle/fixed-cost details and full cycle transaction category totals, separate from the 15 recent transaction sample. budgetGuide exposes actual cash, fixed hold, total stock estimate, stock contribution, food need, savings and shortfall. RPG formulas unchanged.
+- Stock estimate is purchase-value based, not cash or proof of meal/nutrition coverage. Still includes expired recorded stock per current RPG policy; prompt states the limitation.
+- Measure provider latency after restart: larger response may exceed existing 8s provider budget and use fallback; no live Gemini benchmark claimed.

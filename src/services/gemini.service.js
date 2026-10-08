@@ -102,7 +102,7 @@ const executeWithFallback = async ({
 };
 
 // Receipt-only deadline: recipe/insight orchestration remains unchanged.
-async function executeReceiptWithDeadline({systemInstruction,promptParts,requestId='unknown',totalDeadlineMs=120000,signal}, client=genAI, models=FALLBACK_MODELS) {
+async function executeReceiptWithDeadline({systemInstruction,promptParts,requestId='unknown',totalDeadlineMs=120000,signal,contextName='Receipt AI',generationConfig}, client=genAI, models=FALLBACK_MODELS) {
     const deadlineMs=Math.max(1,Math.min(120000,Number(totalDeadlineMs)||120000));
     const startedAt=Date.now();
     const attempts=[];
@@ -124,7 +124,7 @@ async function executeReceiptWithDeadline({systemInstruction,promptParts,request
         if(signal) signal.addEventListener('abort',cancel,{once:true});
         try {
             const model=client.getGenerativeModel({model:modelName,systemInstruction});
-            const request=model.generateContent({contents:[{role:'user',parts:promptParts}],generationConfig:buildReceiptGenerationConfig()}, {signal:abort.signal,timeout:attemptBudget});
+            const request=model.generateContent({contents:[{role:'user',parts:promptParts}],generationConfig:generationConfig || buildReceiptGenerationConfig()}, {signal:abort.signal,timeout:attemptBudget});
             const result=await Promise.race([request,new Promise((_,reject)=>{
                 timer=setTimeout(()=>{const error=new Error('Hết thời gian chờ AI hóa đơn.');error.code='AI_TIMEOUT';error.statusCode=504;reject(error);abort.abort();},attemptBudget);
             })]);
@@ -136,10 +136,10 @@ async function executeReceiptWithDeadline({systemInstruction,promptParts,request
             attempt.status='SUCCESS';attempt.durationMs=Date.now()-attemptStart;
             return {text,response,metadata:{...metadata(),model:modelName,modelDurationMs:attempt.durationMs,finishReason}};
         } catch(error) {
-            if(!signal?.aborted && /abort|timeout/i.test(error.name || '')) error=Object.assign(new Error('Hết thời gian chờ AI hóa đơn.'),{code:'AI_TIMEOUT',statusCode:504,cause:error});
+            if(!signal?.aborted && (abort.signal.aborted || Date.now()-attemptStart >= attemptBudget || /abort|timeout/i.test([error.name,error.message,error.cause?.name,error.cause?.message].filter(Boolean).join(' ')))) error=Object.assign(new Error('Hết thời gian chờ AI hóa đơn.'),{code:'AI_TIMEOUT',statusCode:504,cause:error});
             lastError=signal?.aborted ? Object.assign(new Error('Đã hủy đọc hóa đơn.'),{code:'AI_ABORTED',statusCode:499}) : error.statusCode ? error : wrapGeminiApiError(error);
             attempt.durationMs=Date.now()-attemptStart;attempt.errorCode=lastError.code;
-            console.warn('[Receipt AI attempt]',{requestId,model:modelName,code:lastError.code,durationMs:attempt.durationMs});
+            console.warn(`[${contextName} attempt]`,{requestId,model:modelName,code:lastError.code,durationMs:attempt.durationMs});
             if(signal?.aborted || [400,401,403].includes(lastError.statusCode)) break;
         } finally {
             clearTimeout(timer);
@@ -184,13 +184,14 @@ exports.buildReceiptGenerationConfig = buildReceiptGenerationConfig;
 // Được thiết kế chuyên biệt để gọi OCR, chỉ trả về JSON, không áp dụng logic timeout quá gắt.
 exports.generateStructuredReceipt = async ({systemInstruction,promptParts,requestId='unknown',inputMode='unknown',totalDeadlineMs,signal}) => {
     try {
+        const contextName = inputMode === 'recipe_rag' ? 'Recipe AI' : 'Receipt AI';
         const result = totalDeadlineMs != null
-            ? await executeReceiptWithDeadline({systemInstruction,promptParts,requestId,totalDeadlineMs,signal})
+            ? await executeReceiptWithDeadline({systemInstruction,promptParts,requestId,totalDeadlineMs,signal,contextName})
             : await executeWithFallback({systemInstruction,promptParts,generationConfig:buildReceiptGenerationConfig(),requestId,contextName:'Receipt AI'});
-        console.info('[Receipt AI]',{inputMode,...result.metadata});
+        console.info(`[${contextName}]`,{inputMode,...result.metadata});
         return {text:result.text,metadata:{inputMode,...result.metadata}};
     } catch(error) {
-        console.warn('[Receipt AI error]',{requestId,inputMode,code:error.code,message:error.message});
+        console.warn(inputMode === 'recipe_rag' ? '[Recipe AI error]' : '[Receipt AI error]',{requestId,inputMode,code:error.code,message:error.message});
         throw error;
     }
 };
@@ -213,6 +214,18 @@ exports.generateStructuredFinanceInsight = async ({ systemInstruction, prompt, r
         contextName: 'Finance AI'
     });
     return { text: result.text, metadata: result.metadata };
+};
+
+// Dedicated structured advice: a total deadline aborts provider work rather than
+// racing an unbounded request. Existing finance/receipt callers stay compatible.
+exports.generateContextualAdvice = async ({ systemInstruction, prompt, requestId }) => {
+    if (!process.env.GEMINI_API_KEY) throw Object.assign(new Error('Gemini chưa được cấu hình.'), {code:'GEMINI_NOT_CONFIGURED'});
+    const properties = Object.fromEntries(['headline','analysis','advice','inventoryReminder'].map(key => [key,{type:'STRING'}]));
+    properties.evidenceIds = {type:'ARRAY',items:{type:'STRING'}};
+    properties.actionCode = {type:'STRING',enum:['OPEN_COOKING','REVIEW_TRANSACTIONS','CHECK_INVENTORY','REVIEW_BUDGET']};
+    return executeReceiptWithDeadline({systemInstruction,promptParts:[{text:prompt}],requestId,
+        totalDeadlineMs:20000, contextName:'Capy Insight', generationConfig:{responseMimeType:'application/json',
+            responseSchema:{type:'OBJECT',properties,required:Object.keys(properties)}}});
 };
 
 // Tính năng 3: Phân tích chỉ số Sinh tồn (RPG Stats - HP, Mana, DEF, WIS).

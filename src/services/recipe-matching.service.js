@@ -24,7 +24,20 @@ const NON_ANIMAL_FOOD_PHRASES = Object.freeze([
     'nam dui ga'
 ]);
 
-function normalizeText(value) {
+// Memoize pure name transformations, not inventory quantities or match decisions.
+function memoizeName(transform) {
+    const cache = new Map();
+    return value => {
+        const key = String(value || '');
+        if (cache.has(key)) return cache.get(key);
+        const result = transform(key);
+        if (cache.size >= 4096) cache.delete(cache.keys().next().value);
+        cache.set(key, result);
+        return result;
+    };
+}
+
+const normalizeText = memoizeName(value => {
     return String(value || '')
         .normalize('NFD')
         .replace(/[\u0300-\u036f]/g, '')
@@ -38,9 +51,9 @@ function normalizeText(value) {
         .filter(Boolean)
         .filter(token => !PACKAGE_WORDS.has(token))
         .join(' ');
-}
+});
 
-function canonicalizeName(value) {
+const canonicalizeName = memoizeName(value => {
     return normalizeText(value)
         .replace(/\blon\b/g, 'heo')
         .replace(/\bdoc mung\b/g, 'bac ha')
@@ -49,7 +62,7 @@ function canonicalizeName(value) {
         .replace(/\bhanh hoa\b/g, 'hanh la')
         .replace(/\s+/g, ' ')
         .trim();
-}
+});
 
 function tokenize(value) {
     return new Set(canonicalizeName(value).split(' ').filter(Boolean));
@@ -64,7 +77,7 @@ function nonAnimalFoodIdentity(value) {
     return NON_ANIMAL_FOOD_PHRASES.find(phrase => containsPhrase(normalized, phrase)) || null;
 }
 
-function semanticText(value) {
+const semanticText = memoizeName(value => {
     return String(value || '')
         .normalize('NFC')
         .toLowerCase()
@@ -73,9 +86,9 @@ function semanticText(value) {
         .replace(/\blợn\b/g, 'heo')
         .replace(/\s+/g, ' ')
         .trim();
-}
+});
 
-function animalSignature(value) {
+const animalSignature = memoizeName(value => {
     if (nonAnimalFoodIdentity(value)) {
         return { animal: null, cuts: [], excludedFoodIdentity: true };
     }
@@ -84,7 +97,7 @@ function animalSignature(value) {
     const animal = tokens.find(token => ANIMALS.has(token)) || null;
     const cuts = PRIMARY_CUT_PHRASES.filter(phrase => containsPhrase(normalized, phrase));
     return { animal, cuts, excludedFoodIdentity: false };
-}
+});
 
 function hasCategoryConflict(ingredient, inventoryItem) {
     const recipeCategory = String(ingredient.category || '').toUpperCase();
@@ -141,6 +154,26 @@ function classifyIngredientRelation(ingredient, inventoryItem) {
     if (allowed) {
         return { level: 'SUBSTITUTE', score: RELATION_SCORE.SUBSTITUTE, amountFactor: allowed.amountFactor };
     }
+
+    // Species, cuts and cooking fats are identities, not category synonyms.
+    const fat = value => /\b(dau an|dau oliu|dau olive|dau me|mo heo|mo lon|bo lat)\b/.test(value);
+    if (fat(canonicalRecipe) !== fat(canonicalInventory)) return { level: 'NO_MATCH', score: 0, amountFactor: 1 };
+    if (fat(canonicalRecipe) && fat(canonicalInventory)) {
+        if (canonicalRecipe.includes(' hoac ') && canonicalRecipe.split(' hoac ').some(name => name === canonicalInventory)) return { level: 'EQUIVALENT', score: RELATION_SCORE.EQUIVALENT, amountFactor: 1 };
+        return { level: 'RELATED', score: RELATION_SCORE.RELATED, amountFactor: 1 };
+    }
+    const fishSpecies = value => (value.match(/\bca (hoi|moi|keo|basa|ba sa|loc|thu|ngu|ro|chep|trich|nuc|dieu hong)\b/) || [])[1];
+    if (fishSpecies(canonicalRecipe) && /\bca (chua|tim|rot)\b/.test(canonicalInventory)) return { level: 'NO_MATCH', score: 0, amountFactor: 1 };
+    const recipeSpecies = fishSpecies(canonicalRecipe), stockSpecies = fishSpecies(canonicalInventory);
+    if (recipeSpecies && stockSpecies && recipeSpecies !== stockSpecies) return { level: 'RELATED', score: RELATION_SCORE.RELATED, amountFactor: 1 };
+    if (recipeSpecies && !stockSpecies && /\bca\b/.test(canonicalInventory)) return { level: 'REVIEW_REQUIRED', score: 0, amountFactor: 1 };
+    if (/\bca\b/.test(canonicalRecipe) && /\bca\b/.test(canonicalInventory)) {
+        const part = value => (value.match(/\b(dau|phi le|thit|xuong|duoi)\b/) || [])[1] || 'whole';
+        if (part(canonicalRecipe) !== part(canonicalInventory)) return { level: 'RELATED', score: RELATION_SCORE.RELATED, amountFactor: 1 };
+        if (recipeSpecies && recipeSpecies === stockSpecies) return { level: 'EQUIVALENT', score: RELATION_SCORE.EQUIVALENT, amountFactor: 1 };
+        if (!/\bca (chua|tim|rot)\b/.test(canonicalRecipe) && !/\bca (chua|tim|rot)\b/.test(canonicalInventory)) return { level: 'REVIEW_REQUIRED', score: 0, amountFactor: 1 };
+    }
+
 
     const recipeExcludedFood = nonAnimalFoodIdentity(recipeName);
     const inventoryExcludedFood = nonAnimalFoodIdentity(inventoryName);
@@ -230,9 +263,18 @@ function scaleIngredientAmount(ingredient, servings, baseServings) {
     }
 }
 
+const remainingDaysByTime = new WeakMap();
 function daysRemaining(item, now) {
     if (!item.expiryDate || item.expirySource === 'NOT_APPLICABLE') return null;
-    return daysBetweenVietnamDates(now, item.expiryDate);
+    // A ranking uses one Date object; each expiry is evaluated once in that pass.
+    let cached = remainingDaysByTime.get(now);
+    if (!cached || cached.timestamp !== now.getTime()) {
+        cached = { timestamp: now.getTime(), values: new Map() };
+        remainingDaysByTime.set(now, cached);
+    }
+    const expiry = String(item.expiryDate);
+    if (!cached.values.has(expiry)) cached.values.set(expiry, daysBetweenVietnamDates(now, item.expiryDate));
+    return cached.values.get(expiry);
 }
 
 function matchIngredient(ingredient, inventory, now, rescueThresholdDays) {
@@ -249,7 +291,7 @@ function matchIngredient(ingredient, inventory, now, rescueThresholdDays) {
             const matchedBatches = [];
             for (const item of inventory) {
                 const relation = classifyIngredientRelation(ingredient, item);
-                if (!ACCEPTED_RELATIONS.has(relation.level)) {
+                if (!ACCEPTED_RELATIONS.has(relation.level) || (relation.level === 'SUBSTITUTE' && !ingredient.substitutionConfirmed)) {
                     if (RELATION_SCORE[relation.level] > RELATION_SCORE[bestRejected]) {
                         bestRejected = relation.level;
                     }
@@ -310,7 +352,7 @@ function matchIngredient(ingredient, inventory, now, rescueThresholdDays) {
 
     for (const item of inventory) {
         const relation = classifyIngredientRelation(ingredient, item);
-        if (!ACCEPTED_RELATIONS.has(relation.level)) {
+        if (!ACCEPTED_RELATIONS.has(relation.level) || (relation.level === 'SUBSTITUTE' && !ingredient.substitutionConfirmed)) {
             if (RELATION_SCORE[relation.level] > RELATION_SCORE[bestRejected]) bestRejected = relation.level;
             continue;
         }
@@ -404,7 +446,7 @@ function analyzeRecipe(recipeInput, items, options = {}) {
     const baseServings = Number(recipe.baseServings || recipe.servings || 1);
     const minCookServings = Number(recipe.minCookServings || 1);
     const servingStep = Number(recipe.servingStep || 1);
-    const inventory = usableInventory(items, now);
+    const inventory = options.usableSnapshot === true ? items : usableInventory(items, now);
     const ingredientMatches = (recipe.ingredients || []).map(ingredient =>
         matchIngredient(ingredient, inventory, now, rescueThresholdDays)
     );
@@ -433,7 +475,7 @@ function analyzeRecipe(recipeInput, items, options = {}) {
         })
         .map(match => match.ingredient);
     const missingOptionalIngredients = ingredientMatches
-        .filter(match => !(match.ingredient.required ?? match.ingredient.isCore))
+        .filter(match => match.ingredient.purchaseRequired !== false && !(match.ingredient.required ?? match.ingredient.isCore))
         .filter(match => !ACCEPTED_RELATIONS.has(match.relation) || match.quantityRatio < 1)
         .map(match => match.ingredient);
     const reviewRequiredIngredients = ingredientMatches
@@ -451,12 +493,12 @@ function analyzeRecipe(recipeInput, items, options = {}) {
     ) / matches.length;
 
     const quantifiedOptionalMatches = ingredientMatches.filter(match =>
-        !(match.ingredient.required ?? match.ingredient.isCore)
+        match.ingredient.purchaseRequired !== false && !(match.ingredient.required ?? match.ingredient.isCore)
         && match.requiredAmount > 0
         && match.requiredUnit !== 'NONE'
     );
     const presenceOptionalMatches = ingredientMatches.filter(match =>
-        !(match.ingredient.required ?? match.ingredient.isCore)
+        match.ingredient.purchaseRequired !== false && !(match.ingredient.required ?? match.ingredient.isCore)
         && (match.requiredAmount <= 0 || match.requiredUnit === 'NONE')
     );
 
@@ -548,7 +590,7 @@ function buildConsumptionPlan(recipeInput, items, requestedServings, options = {
 
         const candidates = inventory
             .map(item => ({ item, relation: classifyIngredientRelation(ingredient, item) }))
-            .filter(candidate => ACCEPTED_RELATIONS.has(candidate.relation.level))
+            .filter(candidate => ACCEPTED_RELATIONS.has(candidate.relation.level) && (candidate.relation.level !== 'SUBSTITUTE' || ingredient.substitutionConfirmed))
             .map(candidate => ({
                 ...candidate,
                 converted: toBaseAmount(remainingById.get(String(candidate.item._id)), candidate.item.standardUnit)

@@ -12,7 +12,8 @@ const PUBLIC_RECIPE_FIELDS = Object.freeze([
     'ingredients',
     'steps',
     'tags',
-    'source'
+    'source',
+    'baseRecipeId'
 ]);
 
 const DISH_TYPES = new Set(['MAIN', 'SIDE', 'SOUP', 'DRINK', 'DESSERT', 'SNACK']);
@@ -93,7 +94,9 @@ function toPublicIngredient(ingredient = {}) {
         name: ingredient.name || ingredient.canonicalName || ingredient.itemName || '',
         amount: Number(ingredient.amount) || 0,
         unit: String(ingredient.unit || 'NONE').toUpperCase(),
-        required: Boolean(ingredient.required ?? ingredient.isCore)
+        required: Boolean(ingredient.required ?? ingredient.isCore),
+        ...(ingredient.role ? { role: ingredient.role } : {}),
+        ...(typeof ingredient.purchaseRequired === 'boolean' ? { purchaseRequired: ingredient.purchaseRequired } : {})
     };
 }
 
@@ -104,6 +107,8 @@ function toPublicRecipe(recipeInput) {
     const output = Object.fromEntries(PUBLIC_RECIPE_FIELDS
         .filter(field => recipe[field] !== undefined)
         .map(field => [field, recipe[field]]));
+    if (/^CT_/i.test(String(recipe.recipeId))) output.source = 'SYSTEM';
+    else if (/^ai_recipe_/i.test(String(recipe.recipeId))) output.source = 'AI';
     if (Array.isArray(output.ingredients)) {
         output.ingredients = output.ingredients.map(toPublicIngredient);
     }
@@ -116,6 +121,7 @@ function toPublicRecipe(recipeInput) {
 }
 
 module.exports = {
+    escapeRegExp,
     DISH_TYPES,
     PUBLIC_RECIPE_FIELDS,
     VISIBLE_RECIPE_CLAUSE,

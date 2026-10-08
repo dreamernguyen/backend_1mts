@@ -1,6 +1,6 @@
 # aiMetrics gợi ý món ăn
 
-Áp dụng từ `pipelineVersion: recipe-metrics-2`. Không migration dữ liệu cũ. Ba luồng: OVERVIEW (danh sách đề xuất/giải cứu, không tính món ngẫu nhiên), TODAY (Hôm nay ăn gì), RAG (tìm và điều chỉnh món bằng AI). Giữ thuật toán, model, kho và cơ chế trừ FEFO hiện có.
+Áp dụng từ `pipelineVersion: recipe-metrics-2`. Không migration dữ liệu cũ. Bốn luồng: OVERVIEW (danh sách đề xuất/giải cứu, không tính món ngẫu nhiên), TODAY (Hôm nay ăn gì), RAG (tinh luyện công thức gốc), CREATE (tạo món từ yêu cầu tìm kiếm). Giữ thuật toán, model, kho và cơ chế trừ FEFO hiện có.
 
 ## Sự kiện và ý nghĩa
 
@@ -20,7 +20,7 @@ Tương tác: số session được người dùng sử dụng để nấu. Mu�
 
 ## Truy vấn Compass
 
-Chọn collection `aiMetrics`, tab Aggregations, Text mode. Có thể thêm userId/khoảng createdAt vào $match. Các số là dữ liệu mới sau nâng cấp; OVERVIEW, TODAY, RAG nên trình bày riêng vì luồng/tốc độ khác nhau.
+Chọn collection `aimetrics`, tab Aggregations, Text mode. Có thể thêm userId/khoảng createdAt vào $match. Các số là dữ liệu mới sau nâng cấp; OVERVIEW, TODAY, RAG, CREATE nên trình bày riêng vì luồng/tốc độ khác nhau.
 
 ```javascript
 [
@@ -42,11 +42,11 @@ Chọn collection `aiMetrics`, tab Aggregations, Text mode. Có thể thêm user
         serverGiayTrungBinh: {$divide: ['$serverMsTrungBinh', 1000]}}}
     ],
     hienThi: [
-      {$match: {eventType: 'RESULT_PRESENTED', 'timings.timeToPreviewMs': {$type: 'number'}}},
+      {$match: {eventType: 'RESULT_PRESENTED', stage: {$in: ['TODAY', 'OVERVIEW', 'RAG', 'CREATE']}, 'timings.timeToPreviewMs': {$type: 'number'}}},
       {$group: {_id: '$stage', soMau: {$sum: 1}, msTrungBinh: {$avg: '$timings.timeToPreviewMs'}}},
       {$set: {giayTrungBinh: {$divide: ['$msTrungBinh', 1000]}}}
     ],
-    chatLuong: [
+    khaDungTheoKho: [
       {$match: {eventType: 'AI_RESPONSE', resultStatus: {$ne: 'ERROR'}}},
       {$unwind: '$payload.recipe.candidates'},
       {$match: {$expr: {$and: [{$in: ['$payload.recipe.candidates.recipeId', '$payload.recipe.returnedRecipeIds']},
@@ -70,3 +70,41 @@ Chọn collection `aiMetrics`, tab Aggregations, Text mode. Có thể thêm user
 Mỗi lần trả danh sách là một mẫu vận hành; mỗi món trong danh sách là một mẫu khả dụng. Một món được đề xuất ở nhiều lượt được tính nhiều lần vì snapshot kho có thể thay đổi. Không gọi các tỷ lệ trên là accuracy AI hay đánh giá hương vị.
 
 Kiểm thử thực tế: tải danh sách, bấm Hôm nay ăn gì, tìm RAG, thử kho trống, thử thiếu nguyên liệu, sau đó nấu một món. Kiểm tra mỗi response có một session, RESULT_PRESENTED có thời gian, cook nối đúng session và retry không tăng lượt nấu. Dữ liệu cũ không bổ sung lại được các snapshot/thời gian chưa đo.
+
+
+### Mức sử dụng sau nâng cấp UI
+RESULT_PRESENTED stage DETAIL_OPEN ghi việc mở chi tiết từ phiên gợi ý; DRAFT_SAVED ghi lưu món Cappy thành công. Khử trùng userId/sessionId khi tính tỷ lệ. Chỉ lấy phiên AI_RESPONSE có suggestionCount > 0 làm mẫu số. USER_CONFIRMED cookSuccess=true vẫn là phiên đã dùng món để nấu. Các tỷ lệ này là mức sử dụng, không phải accuracy hay đánh giá hương vị. Bản nháp đã có ID ổn định trước khi lưu để nối với sự kiện nấu.
+
+
+## Chỉ số chính nên dùng trong báo cáo
+1. Vận hành: thời gian phản hồi trung bình server/UI, tỷ lệ lỗi kỹ thuật, số request Gemini theo TODAY/CREATE/RAG. TODAY không gọi Gemini; tìm vector có thể gọi embedding nên không cộng nó thành request tạo công thức.
+2. Tiện ích: tỷ lệ phiên có món được mở chi tiết, tỷ lệ phiên có món được dùng nấu. Đây là mức sử dụng, không suy ra người dùng hài lòng chỉ từ một lần click.
+3. Tạo món: số phiên tạo thành công, số công thức AI người dùng lưu. Tỷ lệ lưu chỉ dùng các phiên CREATE đã gọi Gemini và có món trả về; không trộn tinh luyện khẩu vị vốn không có nút lưu catalog.
+4. Kiểm tra nghiệp vụ: các ca matcher có kỳ vọng (khác loài/phần, thay thế có lựa chọn, đủ/thiếu, FEFO). Tỷ lệ đủ nguyên liệu trong log chỉ là khả dụng của kho, không gọi accuracy AI.
+
+### Compass: tỷ lệ mở, nấu và lưu theo phiên
+Chọn aimetrics → Aggregations → Text. Có thể thêm createdAt/userId vào $match đầu. Query tính riêng từng luồng và khử trùng phiên. Lưu CREATE lấy mẫu số là phiên có món, đã gọi Gemini. Không có mẫu số trả null.
+```javascript
+[
+ {$match: {feature: 'RECIPE_SUGGEST', pipelineVersion: 'recipe-metrics-2'}},
+ {$group: {_id: {userId: '$userId', sessionId: '$sessionId'},
+   mode: {$max: {$cond: [{$eq: ['$eventType', 'AI_RESPONSE']}, '$subFeature', null]}},
+   hasRecipe: {$max: {$cond: [{$and: [{$eq: ['$eventType', 'AI_RESPONSE']}, {$gt: ['$suggestionCount', 0]}]}, 1, 0]}},
+   generated: {$max: {$cond: [{$and: [{$eq: ['$eventType', 'AI_RESPONSE']}, {$eq: ['$usedAiFallback', true]}, {$gt: ['$suggestionCount', 0]}]}, 1, 0]}},
+   opened: {$max: {$cond: [{$and: [{$eq: ['$eventType', 'RESULT_PRESENTED']}, {$eq: ['$stage', 'DETAIL_OPEN']}]}, 1, 0]}},
+   saved: {$max: {$cond: [{$and: [{$eq: ['$eventType', 'RESULT_PRESENTED']}, {$eq: ['$stage', 'DRAFT_SAVED']}]}, 1, 0]}},
+   cooked: {$max: {$cond: [{$and: [{$eq: ['$eventType', 'USER_CONFIRMED']}, {$eq: ['$cookSuccess', true]}]}, 1, 0]}}
+ }},
+ {$match: {hasRecipe: 1, mode: {$in: ['TODAY', 'OVERVIEW', 'CREATE', 'RAG']}}},
+ {$group: {_id: '$mode', soPhienCoMon: {$sum: 1}, soPhienMoChiTiet: {$sum: '$opened'}, soPhienDaNau: {$sum: '$cooked'},
+   soPhienTaoMon: {$sum: {$cond: [{$eq: ['$mode', 'CREATE']}, '$generated', 0]}},
+   soPhienTaoMonDaLuu: {$sum: {$cond: [{$and: [{$eq: ['$mode', 'CREATE']}, {$eq: ['$generated', 1]}]}, '$saved', 0]}}
+ }},
+ {$set: {
+   tyLeMoChiTietPct: {$multiply: [100, {$divide: ['$soPhienMoChiTiet', '$soPhienCoMon']}]},
+   tyLeDaNauPct: {$multiply: [100, {$divide: ['$soPhienDaNau', '$soPhienCoMon']}]},
+   tyLeLuuMonMoiPct: {$cond: [{$gt: ['$soPhienTaoMon', 0]}, {$multiply: [100, {$divide: ['$soPhienTaoMonDaLuu', '$soPhienTaoMon']}]}, null]}
+ }}
+]
+```
+Nếu phiên bị lọc bởi khoảng thời gian, cần cho phép đủ thời gian để người dùng mở/lưu/nấu. Dữ liệu cũ chưa tách CREATE hoặc thiếu DETAIL_OPEN không dùng để suy ra các tỷ lệ mới. Query cần chạy với dữ liệu thật trong Compass; test tự động không thay thế kiểm chứng tập dữ liệu báo cáo.

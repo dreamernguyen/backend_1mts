@@ -24,6 +24,8 @@ const substitutionSchema = new mongoose.Schema({
 }, { _id: false });
 
 const ingredientSchema = new mongoose.Schema({
+    role: { type: String, enum: ['MAIN', 'SECONDARY', 'SEASONING'], default: null },
+    purchaseRequired: { type: Boolean, default: null },
     name: { type: String, trim: true, default: '' },
     required: { type: Boolean, default: null },
     // Đọc tương thích dữ liệu cũ trong thời gian import bộ recipe schema gọn.
@@ -123,6 +125,7 @@ const recipeSchema = new mongoose.Schema(
             default: 'ACTIVE'
         },
         dataVersion: { type: Number, min: 1, default: 1 },
+        baseRecipeId: { type: String, default: null },
         testTag: { type: String, trim: true, default: null },
         
         // Trường lưu trữ Vector nhúng cho MongoDB Atlas Vector Search

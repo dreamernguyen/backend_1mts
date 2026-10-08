@@ -44,7 +44,7 @@ exports.getSavedRecipes = async (req, res, next) => {
 
         const recipes = await Recipe.find({
             $and: [
-                VISIBLE_RECIPE_CLAUSE,
+                { $or: [VISIBLE_RECIPE_CLAUSE, { source: 'AI', status: 'DRAFT' }] },
                 { recipeId: { $in: user.savedRecipes } }
             ]
         }).select(publicRecipeProjection()).sort({ recipeId: 1 }).lean();
@@ -251,15 +251,11 @@ exports.updateSettings = async (req, res, next) => {
             await settingsSession.withTransaction(async () => {
                 const locked = await finance.lockUser(userId, settingsSession);
                 if (locked.finance?.initializedAt) {
-                    const currentCycle = await finance.captureCycle(locked, settingsSession);
-                    const requestedDay = cycleStartDay === undefined ? null : Number(cycleStartDay);
-                    if (requestedDay && requestedDay !== locked.cycleStartDay) {
-                        if (locked.finance.pendingCycleAt && requestedDay !== locked.finance.pendingCycleDay) {
-                            throw finance.fail('Đã có thay đổi ngày chu kỳ chờ áp dụng.');
-                        }
-                        updateData['finance.pendingCycleDay'] = requestedDay;
-                        updateData['finance.pendingCycleAt'] = locked.finance.pendingCycleAt || currentCycle.endExclusive;
-                        delete updateData.cycleStartDay;
+                    await finance.captureCycle(locked, settingsSession);
+                    if (cycleStartDay !== undefined) {
+                        updateData.cycleStartDay = Number(cycleStartDay);
+                        updateData['finance.pendingCycleDay'] = null;
+                        updateData['finance.pendingCycleAt'] = null;
                     }
                 }
                 user = await User.findByIdAndUpdate(userId, updateData, { new: true, runValidators: true, session: settingsSession });

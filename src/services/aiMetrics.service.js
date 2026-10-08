@@ -21,11 +21,11 @@ const _insert = (payload) => {
     });
 };
 
-exports.logInsightMetric = ({ userId, sessionId, subFeature, eventType = 'AI_RESPONSE', engine = 'GEMINI', resultStatus = 'SUCCESS', latencyMs = null, aiModel = null, error = null }) => {
+exports.logInsightMetric = ({ userId, sessionId, subFeature, eventType = 'AI_RESPONSE', engine = 'GEMINI', resultStatus = 'SUCCESS', latencyMs = null, aiModel = null, error = null, modelLatencyMs = null, cacheHit = null, pipelineVersion, providerAttempts, providerAttemptDetails, tokenUsage }) => {
     _insert({
         userId, feature: 'GAMIFICATION', subFeature, eventType, sessionId,
-        engine, resultStatus, latencyMs, modelLatencyMs: engine === 'GEMINI' ? latencyMs : null,
-        endToEndLatencyMs: latencyMs, aiModel,
+        engine, resultStatus, latencyMs, modelLatencyMs, cacheHit, pipelineVersion, providerAttempts, providerAttemptDetails, tokenUsage,
+        endToEndLatencyMs: null, aiModel,
         failureStage: error ? (resultStatus === 'VALIDATION_REJECTED' ? 'VALIDATION' : 'PROVIDER') : null,
         errorCode: error?.code || null,
         errorMessage: error?.message ? String(error.message).slice(0, 500) : null
@@ -370,9 +370,13 @@ exports.logRecipeUserConfirmed = ({
     suggestionRank = null, cookSuccess = false, usedAiFallback = false, recipeId = null
 }) => {
     Promise.resolve().then(async () => {
-        const response = await AiMetrics.findOne({ userId, feature: 'RECIPE_SUGGEST', eventType: 'AI_RESPONSE',
+        let response = await AiMetrics.findOne({ userId, feature: 'RECIPE_SUGGEST', eventType: 'AI_RESPONSE',
             pipelineVersion: 'recipe-metrics-2', sessionId,
             $or: [{ recipeId }, { 'payload.recipe.returnedRecipeIds': recipeId }] }).select('payload.recipe recommendationSource usedAiFallback').lean();
+        if (!response) {
+            const saved = await AiMetrics.findOne({ userId, feature: 'RECIPE_SUGGEST', eventType: 'RESULT_PRESENTED', stage: 'DRAFT_SAVED', sessionId, recipeId }).select('_id').lean();
+            if (saved) response = await AiMetrics.findOne({ userId, feature: 'RECIPE_SUGGEST', eventType: 'AI_RESPONSE', pipelineVersion: 'recipe-metrics-2', sessionId }).select('payload.recipe recommendationSource usedAiFallback').lean();
+        }
         if (!response) return;
         const rank = response.payload?.recipe?.returnedRecipeIds?.indexOf(recipeId);
         _insert({ userId, feature: 'RECIPE_SUGGEST', pipelineVersion: 'recipe-metrics-2', eventType: 'USER_CONFIRMED',
@@ -483,4 +487,8 @@ exports.logReceiptAiError = p => {
         reasonCode: p.errorCode, errorCode: p.errorCode, errorMessage: p.errorMessage ? String(p.errorMessage).slice(0, 500) : undefined,
         providerAttempts: p.providerAttemptCount ?? p.providerAttempts?.length,
         providerAttemptDetails: (p.providerAttempts || []).slice(0, 4).map(a => ({ model: a.model, durationMs: a.durationMs, status: a.status, code: a.code || a.errorCode })) });
+};
+
+exports.logRecipeSaved = ({ userId, sessionId, recipeId }) => {
+ _insert({ userId, feature: 'RECIPE_SUGGEST', pipelineVersion: 'recipe-metrics-2', eventType: 'RESULT_PRESENTED', stage: 'DRAFT_SAVED', sessionId, operationId: sessionId, recipeId, origin: 'SERVER' });
 };
