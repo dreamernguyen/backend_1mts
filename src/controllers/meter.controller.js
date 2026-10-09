@@ -119,7 +119,7 @@ exports.recognizeReading = asyncHandler(async (req, res) => {
         ? String(req.body.attemptId) : aiSessionId;
     const parentAttemptId = /^[A-Za-z0-9_-]{8,150}$/.test(String(req.body?.parentAttemptId || ''))
         ? String(req.body.parentAttemptId) : null;
-    const budgetMs = Math.max(1, Math.min(Number(req.body?.remainingBudgetMs) || 8000, 10000));
+    const budgetMs = meterAiService.normalizeMeterBudget(req.body?.remainingBudgetMs);
     const abortController = new AbortController();
     const onClose = () => { if (!res.writableEnded) abortController.abort(); };
     res.on('close', onClose);

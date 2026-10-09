@@ -2,6 +2,11 @@ const { GoogleGenerativeAI } = require('@google/generative-ai');
 
 const MODELS = ['gemini-3.5-flash-lite', 'gemini-3.1-flash-lite'];
 const PIPELINE_VERSION = 'meter-v3';
+const MAX_PROVIDER_BUDGET_MS = 25000;
+function normalizeMeterBudget(value) {
+    const number = Number(value);
+    return Math.max(1, Math.min(Number.isFinite(number) && number > 0 ? number : 8000, MAX_PROVIDER_BUDGET_MS));
+}
 const meterError = (code, message, statusCode = 502) => Object.assign(new Error(message), { code, statusCode });
 
 // Keep optical text separate from its numeric value. Never reconstruct leading
@@ -93,7 +98,7 @@ async function recognizeMeter({ meterType, imageBase64, mimeType, candidates, bu
         systemInstruction: 'Bạn là bộ đọc ảnh công tơ, không phải bộ dự đoán. Chỉ đọc bằng chứng nhìn thấy.',
         generationConfig: { responseMimeType: 'application/json', temperature: 0 }
     }).generateContent({ contents: [{ role: 'user', parts: promptParts }] }, { signal: requestSignal }));
-    const duration = Math.max(1, Math.min(Number.isFinite(budgetMs) ? budgetMs : 8000, 10000));
+    const duration = normalizeMeterBudget(budgetMs);
     const started = performance.now();
     const controller = new AbortController();
     let rejectCancelled;
@@ -141,4 +146,4 @@ async function recognizeMeter({ meterType, imageBase64, mimeType, candidates, bu
     }
 }
 
-module.exports = { recognizeMeter, parseMeterResult, boundedCandidates, buildMeterPrompt, PIPELINE_VERSION };
+module.exports = { recognizeMeter, parseMeterResult, boundedCandidates, buildMeterPrompt, PIPELINE_VERSION, normalizeMeterBudget };
