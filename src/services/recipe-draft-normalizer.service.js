@@ -43,8 +43,10 @@ function normalizeGeneratedRecipe(input, defaults = {}) {
         if (item.purchaseRequired != null && typeof item.purchaseRequired !== 'boolean') throw validationError('purchaseRequired phải là boolean.');
         // Plain water is an instruction quantity, never stock or a shopping item.
         // Normalize these flags deterministically; do not exempt any food.
-        const purchaseRequired = water ? false : item.purchaseRequired ?? true;
-        if (!purchaseRequired && !water) throw validationError('Thực phẩm và gia vị vẫn cần đối chiếu kho hoặc đưa vào đi chợ.');
+        // AI may confuse "already in stock" or "optional" with exempt from
+        // inventory matching. Every retained food/spice must still be matched;
+        // required remains independent and plain water is the only exemption.
+        const purchaseRequired = !water;
         if (/^nuoc (dung|leo|luoc)/.test(identity) && !/goi|dong goi|hop|chai/.test(identity)) throw validationError('Cần liệt kê nguyên liệu nấu nước dùng hoặc gói nước dùng mua được, không liệt kê thành phẩm tự nấu.');
         if (/thit cua.*luoc san/.test(identity) && !/dong goi|hop|mua san/.test(identity)) throw validationError('Cần ghi cua nguyên liệu hoặc thịt cua sơ chế đóng gói, không ghi chung chung thịt cua luộc sẵn.');
         const requestedScalingMode = compact(item?.scalingMode).toUpperCase();
